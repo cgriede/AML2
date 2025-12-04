@@ -77,9 +77,14 @@ def get_sequences(arr):
 
 def submit():
     raise NotImplementedError("Not implemented")
+    submission_file = "mysubmissionfile.csv"
+    cmd = f"""
+    kaggle competitions submit -c eth-aml-2025-project-task-2 -f {submission_file} -m "Message"
+    """
     #create submission file
     df = pd.DataFrame({"id":ids, "value":[list(map(int, minili)) for minili in values]})
-    df.to_csv(f"mysubmissionfile_{THRESHOLD}.csv", index=False)
+    df.to_csv(submission_file, index=False)
+    os.system(cmd)
 
 
 class ValveSegmentationModel:
