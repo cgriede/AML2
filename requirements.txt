@@ -1,0 +1,9 @@
+pickle
+numpy
+pandas
+IPython
+tqdm
+matplotlib
+torch
+torchvision
+ipykernel

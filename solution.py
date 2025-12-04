@@ -88,6 +88,13 @@ def submit():
 
 
 class ValveSegmentationModel:
+    def __init__(self, input_shape, output_shape, mode):
+        pass
+
+    def forward(self, x):
+        pass
+
+class ValveSegmentationAgent:
     def __init__(self):
         #TODO:create the data attributes for the model
         self.videos_raw = None
