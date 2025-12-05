@@ -1,14 +1,9 @@
 import pickle
 import gzip
-from tkinter import NO
 import numpy as np
 import os
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from IPython.display import HTML  # For rendering animation in Jupyter
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
 def load_zipped_pickle(filename):
     with gzip.open(filename, 'rb') as f:
@@ -61,8 +56,6 @@ def preprocess_test_data(data):
         names += [item['name'] for _ in video]
     return names, video_frames
 
-
-
 def get_sequences(arr):
     first_indices, last_indices, lengths = [], [], []
     n, i = len(arr), 0
@@ -85,7 +78,6 @@ def submit():
     df = pd.DataFrame({"id":ids, "value":[list(map(int, minili)) for minili in values]})
     df.to_csv(submission_file, index=False)
     os.system(cmd)
-
 
 class ValveSegmentationModel:
     def __init__(self, input_shape, output_shape, mode):
@@ -179,18 +171,6 @@ def main():
     names, videos, masks, boxes, label_types = preprocess_train_data(train_data)
     test_names, test_videos = preprocess_test_data(test_data)
 
-_train_data_structure = {
-    "name": "str, video name",
-    "video": "array[height, width, number of frames], video frames",
-    "box": "array[height, width], bounding box of the valve",
-    "label": "array[height, width, number of frames], label of the valve",
-    "frames": "list[int], labeled frames indices",
-    "dataset": ("amateur", "expert")
-}
-_test_data_structure = {
-    "name": "str, video name",
-    "video": "array[height, width, number of frames], video frames",
-}
 
 
 if __name__ == "__main__":

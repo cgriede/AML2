@@ -1,0 +1,14 @@
+{
+  "_train_data_structure": {
+    "name": "str, video name",
+    "video": "array[height, width, number of frames], video frames",
+    "box": "array[height, width], bounding box of the valve",
+    "label": "array[height, width, number of frames], label of the valve",
+    "frames": "list[int], labeled frames indices",
+    "dataset": ["amateur", "expert"]
+  },
+  "_test_data_structure": {
+    "name": "str, video name",
+    "video": "array[height, width, number of frames], video frames"
+  }
+}
