@@ -3,7 +3,7 @@ MedNeXt-based Mitral Valve Segmentation Pipeline (Simplified - 400 lines)
 
 Lean implementation focusing on core ML pipeline:
 - Data loading (fixed approach)
-- Simple model (U-Net placeholder)
+- MedNeXt model
 - Hybrid loss (Dice + CrossEntropy)
 - Training loop
 - Inference & submission
@@ -13,150 +13,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-import pickle
-import gzip
+from torch.utils.data import DataLoader, random_split
 import pandas as pd
 from tqdm import tqdm
-import os
-import sys
-from scipy import ndimage
-from utils import debug, d  # Easy debugging: debug(var) or var.debug()
 
-# Add mednext to path
 from mednext import create_mednext_v1
-
-
-# ============================================================================
-# DATA LOADING AND PREPROCESSING
-# ============================================================================
-
-def load_zipped_pickle(filename):
-    with gzip.open(filename, 'rb') as f:
-        return pickle.load(f)
-
-
-def resize_frame(frame, target_size=(128, 128)):
-    """Resize frame using scipy zoom to maintain aspect ratio or fit exactly"""
-    h, w = frame.shape[:2]
-    if (h, w) == target_size:
-        return frame
-    
-    # Calculate zoom factors
-    zoom_h = target_size[0] / h
-    zoom_w = target_size[1] / w
-    
-    # Use nearest neighbor for segmentation masks, linear for images
-    order = 0 if frame.ndim == 2 else 0
-    resized = ndimage.zoom(frame, (zoom_h, zoom_w) + (1,) * (frame.ndim - 2), order=order)
-    return resized
-
-
-class MitralValveDataset(Dataset):
-    """Load temporal sequences from train.pkl - lazy loading, compute on demand"""
-    
-    def __init__(self, data_list, seq_len=3, target_size=None):
-        self.data_list = data_list
-        self.seq_len = seq_len
-        self.target_size = target_size  # None = no resize (use original size)
-        self.indices = []  # Store (item_idx, frame_idx) pairs
-        
-        for item_idx, item in enumerate(data_list):
-            for center_idx in item['frames']:
-                self.indices.append((item_idx, center_idx))
-    
-    def __len__(self):
-        return len(self.indices)
-    
-    def __getitem__(self, idx):
-        item_idx, center_idx = self.indices[idx]
-        item = self.data_list[item_idx]
-        
-        video = item['video'].astype(np.float32) / 255.0
-        label = item['label'].astype(np.float32)
-        num_frames = video.shape[2]
-        
-        # Get seq_len consecutive frames centered on labeled frame
-        start_idx = max(0, center_idx - self.seq_len // 2)
-        end_idx = min(num_frames, start_idx + self.seq_len)
-        start_idx = max(0, end_idx - self.seq_len)
-        
-        seq = video[:, :, start_idx:end_idx]
-        mask_seq = label[:, :, start_idx:end_idx]
-        
-        if seq.shape[2] < self.seq_len:
-            pad_width = ((0, 0), (0, 0), (0, self.seq_len - seq.shape[2]))
-            seq = np.pad(seq, pad_width, mode='edge')
-            mask_seq = np.pad(mask_seq, pad_width, mode='edge')
-        
-        # Only resize if target_size is specified
-        if self.target_size is not None:
-            seq_resized = np.zeros((self.target_size[0], self.target_size[1], self.seq_len), dtype=np.float32)
-            mask_resized = np.zeros((self.target_size[0], self.target_size[1], self.seq_len), dtype=np.float32)
-            for t in range(self.seq_len):
-                seq_resized[:, :, t] = resize_frame(seq[:, :, t], self.target_size)
-                mask_resized[:, :, t] = resize_frame(mask_seq[:, :, t], self.target_size)
-        else:
-            # Use original size (assuming all training videos have same size)
-            seq_resized = seq
-            mask_resized = mask_seq
-        
-        seq_resized = np.expand_dims(seq_resized, axis=0)
-        mask_resized = np.expand_dims(mask_resized, axis=0)
-        
-        return {
-            'frame': torch.from_numpy(seq_resized).float(),
-            'mask': torch.from_numpy(mask_resized).float()
-        }
-
-
-class TestDataset(Dataset):
-    """Load temporal sequences from test.pkl - lazy loading, compute on demand"""
-    
-    def __init__(self, data_list, seq_len=3, target_size=(112, 112)):
-        self.data_list = data_list
-        self.seq_len = seq_len
-        self.target_size = target_size
-        self.indices = []  # Store (item_idx, frame_idx) pairs
-        
-        for item_idx, item in enumerate(data_list):
-            num_frames = item['video'].shape[2]
-            for frame_idx in range(num_frames):
-                self.indices.append((item_idx, frame_idx))
-            
-    def __len__(self):
-        return len(self.indices)
-    
-    def __getitem__(self, idx):
-        item_idx, frame_idx = self.indices[idx]
-        item = self.data_list[item_idx]
-        
-        video = item['video'].astype(np.float32) / 255.0
-        num_frames = video.shape[2]
-        
-        # Center sequence on current frame
-        start_idx = max(0, frame_idx - self.seq_len // 2)
-        end_idx = min(num_frames, start_idx + self.seq_len)
-        start_idx = max(0, end_idx - self.seq_len)
-        
-        seq = video[:, :, start_idx:end_idx]
-        
-        if seq.shape[2] < self.seq_len:
-            pad_width = ((0, 0), (0, 0), (0, self.seq_len - seq.shape[2]))
-            seq = np.pad(seq, pad_width, mode='edge')
-        
-        # Resize to target size (to match training data size)
-        seq_resized = np.zeros((self.target_size[0], self.target_size[1], self.seq_len), dtype=np.float32)
-        for t in range(self.seq_len):
-            seq_resized[:, :, t] = resize_frame(seq[:, :, t], self.target_size)
-        
-        seq_resized = np.expand_dims(seq_resized, axis=0)
-        
-        return {
-            'frame': torch.from_numpy(seq_resized).float(),
-            'name': item['name'],
-            'frame_idx': frame_idx
-        }
+from utils import debug
+from data_prep import load_zipped_pickle, resize_frame, MitralValveDataset, TestDataset, DatasetType
 
 
 # ============================================================================
@@ -396,14 +259,34 @@ def save_submission(predictions, test_data, output_file='submission.csv'):
     print(f"Submission saved to {output_file}")
 
 
+MACHINE_INFO = {}
+WORKSPACE = "codespace-2"
+
+
+if WORKSPACE == "codespace-2":
+    MACHINE_INFO = {
+        "NUM_CPUS" : 2,
+        "RAM_GB" : 8,
+        "DEVICE" : "cpu"
+    }
+if WORKSPACE == "home_station":
+    MACHINE_INFO = {
+        "NUM_CPUS" : 16,
+        "RAM_GB" : 64,
+        "DEVICE" : "cuda"
+    }
+
+
 def main():
-    # TODO: Hyperparameters (add dropout, change LR, batch size, etc.)
-    BATCH_SIZE = 8
-    NUM_EPOCHS = 100
-    LEARNING_RATE = 1e-4
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+    DEVICE = MACHINE_INFO["DEVICE"]
     print(f"Device: {DEVICE}\n")
+    
+    # TODO: Hyperparameters (add dropout, change LR, batch size, etc.)
+    learning_rate = 1e-4
+    n_epochs = 1
+
+    #machine dependant hyperparameters
+    batch_size = 4
     
     # Load data
     train_data = load_zipped_pickle('train.pkl')
@@ -444,7 +327,6 @@ def main():
     num_val = int(0.2 * len(dataset))
     train_ds, val_ds = random_split(dataset, [len(dataset) - num_val, num_val])
 
-    #TODO: model init, instantiate a model
     #TODO: define the model
 
     #TODO: evaluate the
@@ -461,10 +343,14 @@ def main():
     
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}\n")
     
+    #TODO: model init, instantiate a model
     # Model
     model = SegmentationNet().to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    loss_fn = HybridLoss()
+    #TODO: define the optimizer
+    #optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    
+    #TODO: define the LossFn
+    #loss_fn = HybridLoss()
     
     # Training loop
     best_iou = 0.0
