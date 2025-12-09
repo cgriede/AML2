@@ -21,10 +21,10 @@ from tqdm import tqdm
 import os
 import sys
 from scipy import ndimage
+from utils import debug, d  # Easy debugging: debug(var) or var.debug()
 
 # Add mednext to path
-sys.path.insert(0, '/workspaces/AML2/mednext')
-from nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
+from mednext import create_mednext_v1
 
 
 # ============================================================================
@@ -55,9 +55,10 @@ def resize_frame(frame, target_size=(128, 128)):
 class MitralValveDataset(Dataset):
     """Load temporal sequences from train.pkl - lazy loading, compute on demand"""
     
-    def __init__(self, data_list, seq_len=3):
+    def __init__(self, data_list, seq_len=3, target_size=None):
         self.data_list = data_list
         self.seq_len = seq_len
+        self.target_size = target_size  # None = no resize (use original size)
         self.indices = []  # Store (item_idx, frame_idx) pairs
         
         for item_idx, item in enumerate(data_list):
@@ -88,12 +89,17 @@ class MitralValveDataset(Dataset):
             seq = np.pad(seq, pad_width, mode='edge')
             mask_seq = np.pad(mask_seq, pad_width, mode='edge')
         
-        # Resize all frames to consistent size (H, W, T)
-        seq_resized = np.zeros((128, 128, self.seq_len), dtype=np.float32)
-        mask_resized = np.zeros((128, 128, self.seq_len), dtype=np.float32)
-        for t in range(self.seq_len):
-            seq_resized[:, :, t] = resize_frame(seq[:, :, t], (128, 128))
-            mask_resized[:, :, t] = resize_frame(mask_seq[:, :, t], (128, 128))
+        # Only resize if target_size is specified
+        if self.target_size is not None:
+            seq_resized = np.zeros((self.target_size[0], self.target_size[1], self.seq_len), dtype=np.float32)
+            mask_resized = np.zeros((self.target_size[0], self.target_size[1], self.seq_len), dtype=np.float32)
+            for t in range(self.seq_len):
+                seq_resized[:, :, t] = resize_frame(seq[:, :, t], self.target_size)
+                mask_resized[:, :, t] = resize_frame(mask_seq[:, :, t], self.target_size)
+        else:
+            # Use original size (assuming all training videos have same size)
+            seq_resized = seq
+            mask_resized = mask_seq
         
         seq_resized = np.expand_dims(seq_resized, axis=0)
         mask_resized = np.expand_dims(mask_resized, axis=0)
@@ -107,18 +113,17 @@ class MitralValveDataset(Dataset):
 class TestDataset(Dataset):
     """Load temporal sequences from test.pkl - lazy loading, compute on demand"""
     
-    def __init__(self, data_list, seq_len=3):
+    def __init__(self, data_list, seq_len=3, target_size=(112, 112)):
         self.data_list = data_list
         self.seq_len = seq_len
+        self.target_size = target_size
         self.indices = []  # Store (item_idx, frame_idx) pairs
         
         for item_idx, item in enumerate(data_list):
             num_frames = item['video'].shape[2]
             for frame_idx in range(num_frames):
                 self.indices.append((item_idx, frame_idx))
-        
-        print(f"[DEBUG][TestDataset] Created dataset with {len(self.indices)} sequences from {len(data_list)} videos")
-    
+            
     def __len__(self):
         return len(self.indices)
     
@@ -140,10 +145,10 @@ class TestDataset(Dataset):
             pad_width = ((0, 0), (0, 0), (0, self.seq_len - seq.shape[2]))
             seq = np.pad(seq, pad_width, mode='edge')
         
-        # Resize all frames to consistent size (H, W, T)
-        seq_resized = np.zeros((128, 128, self.seq_len), dtype=np.float32)
+        # Resize to target size (to match training data size)
+        seq_resized = np.zeros((self.target_size[0], self.target_size[1], self.seq_len), dtype=np.float32)
         for t in range(self.seq_len):
-            seq_resized[:, :, t] = resize_frame(seq[:, :, t], (128, 128))
+            seq_resized[:, :, t] = resize_frame(seq[:, :, t], self.target_size)
         
         seq_resized = np.expand_dims(seq_resized, axis=0)
         
@@ -163,21 +168,16 @@ class SegmentationNet(nn.Module):
     
     def __init__(self, in_channels=1, num_classes=2):
         super().__init__()
-        
-        # Use MedNeXt Small in 2D mode - process each frame independently
-        # Temporal consistency enforced through loss (consecutive predictions should be similar)
-        self.model = MedNeXt(
-            in_channels=in_channels,
-            n_channels=32,              # Small model channels
-            n_classes=num_classes,
-            exp_r=2,                    # Small model expansion ratio
-            kernel_size=3,              # 3x3 kernels (spatial only)
-            deep_supervision=False,
-            do_res=True,
-            do_res_up_down=True,
-            block_counts=[2,2,2,2,2,2,2,2,2],  # Small model architecture
-            dim='2d'                    # 2D mode for frame-by-frame processing
+        # For binary segmentation (MV vs background)
+        model = create_mednext_v1(
+            num_input_channels=1,      # Grayscale ultrasound frames
+            num_classes=1,             # Binary: sigmoid output
+            model_id='S',
+            kernel_size=3,             # Start small (3x3x3 depthwise)
+            deep_supervision=True      # Helps training on small data
         )
+        model = model.cuda() if torch.cuda.is_available() else model
+        print(model)  # Inspect layers
     
     def forward(self, x):
         # x shape: (B, 1, H, W, T) where T is sequence length
@@ -275,9 +275,6 @@ def train_epoch(model, loader, optimizer, loss_fn, device):
     for batch_idx, batch in enumerate(tqdm(loader, desc='Train')):
         frames = batch['frame'].to(device)
         masks = batch['mask'].to(device)
-        if batch_idx == 0:
-            print(f"[DEBUG][train] frames.shape: {frames.shape}, frames.device: {frames.device}")
-            print(f"[DEBUG][train] masks.shape: {masks.shape}, masks.device: {masks.device}")
         optimizer.zero_grad()
         try:
             pred = model(frames)
@@ -302,9 +299,6 @@ def validate(model, loader, loss_fn, device):
         for batch_idx, batch in enumerate(tqdm(loader, desc='Val')):
             frames = batch['frame'].to(device)
             masks = batch['mask'].to(device)
-            if batch_idx == 0:
-                print(f"[DEBUG][val] frames.shape: {frames.shape}, frames.device: {frames.device}")
-                print(f"[DEBUG][val] masks.shape: {masks.shape}, masks.device: {masks.device}")
             try:
                 pred = model(frames)  # (B, 2, H, W, T)
             except Exception as e:
@@ -335,8 +329,6 @@ def predict_test(model, loader, device, test_data):
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc='Predict')):
             frames = batch['frame'].to(device)
-            if batch_idx == 0:
-                print(f"[DEBUG][predict] frames.shape: {frames.shape}, frames.device: {frames.device}")
             names = batch['name']
             frame_indices = batch['frame_idx'].cpu().numpy()
             try:
@@ -357,15 +349,17 @@ def predict_test(model, loader, device, test_data):
                 
                 predictions[name][int(frame_indices[i])] = pred_valve[i]
     
-    # Reconstruct full video masks
+    # Reconstruct full video masks at ORIGINAL resolution
     results = {}
     for item in test_data:
         name = item['name']
-        shape = item['video'].shape
+        orig_shape = item['video'].shape  # Original video shape (H, W, T)
         
-        full_mask = np.zeros(shape, dtype=bool)
-        for frame_idx, mask in predictions[name].items():
-            full_mask[:, :, frame_idx] = mask > 0.5
+        full_mask = np.zeros(orig_shape, dtype=bool)
+        for frame_idx, mask_112 in predictions[name].items():
+            # Resize from 112x112 back to original size
+            mask_orig = resize_frame(mask_112, (orig_shape[0], orig_shape[1]))
+            full_mask[:, :, frame_idx] = mask_orig > 0.5
         
         results[name] = full_mask
     
@@ -415,13 +409,50 @@ def main():
     train_data = load_zipped_pickle('train.pkl')
     test_data = load_zipped_pickle('test.pkl')
     print(f"Loaded {len(train_data)} training videos and {len(test_data)} test videos\n")
+    
+    # Print video sizes for debugging
+    print("Training video sizes:")
+    train_shapes = {}
+    for i, item in enumerate(train_data):
+        shape = item['video'].shape
+        shape = shape[:2]
+        if shape not in train_shapes:
+            train_shapes[shape] = 0
+        train_shapes[shape] += 1
+    for key, value in train_shapes.items():
+        print(f"  Shape {key}: {value} videos")
+    print()
+    
+    print("Test video sizes:")
+    test_shapes = {}
+    for i, item in enumerate(test_data):
+        shape = item['video'].shape
+        shape = shape[:2]
+        if shape not in test_shapes:
+            test_shapes[shape] = 0
+        test_shapes[shape] += 1
+    for key, value in test_shapes.items():
+        print(f"  Shape {key}: {value} videos")
+    print()
+    #TODO: choose target size for reshape (make adjustable)
+    TARGET_SHAPE = (384, 512)
+    #TODO: choose input temporal design (make adjustable)
 
-    # Create datasets
-    dataset = MitralValveDataset(train_data)
+    #TODO: Create datasets
+    # Training data: use original 112x112 size (no resize needed)
+    dataset = MitralValveDataset(train_data, target_size=TARGET_SHAPE)
     num_val = int(0.2 * len(dataset))
     train_ds, val_ds = random_split(dataset, [len(dataset) - num_val, num_val])
-    test_ds = TestDataset(test_data)
-    print(f"Created datasets: Train={len(train_ds)}, Val={len(val_ds)}, Test={len(test_ds)}\n")
+
+    #TODO: model init, instantiate a model
+    #TODO: define the model
+
+    #TODO: evaluate the
+
+    
+    # Test data: resize to 112x112 to match training
+    test_ds = TestDataset(test_data, target_size=(112, 112))
+    print(f"Created datasets: Train={len(train_ds)}, Val={len(val_ds)}, Test={len(test_ds)}")
 
     
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
