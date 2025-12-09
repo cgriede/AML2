@@ -43,18 +43,7 @@ class SegmentationNet(nn.Module):
         print(model)  # Inspect layers
     
     def forward(self, x):
-        # x shape: (B, 1, H, W, T) where T is sequence length
-        # Process each frame through the model and stack outputs
-        b, c, h, w, t = x.shape
-        outputs = []
-        
-        for i in range(t):
-            frame = x[:, :, :, :, i]  # (B, 1, H, W)
-            out = self.model(frame)   # (B, 2, H, W)
-            outputs.append(out)
-        
-        # Stack outputs: (B, 2, H, W, T)
-        output = torch.stack(outputs, dim=-1)
+        #define input output behaviour
         return output
 
 
@@ -292,6 +281,9 @@ def main():
     train_data = load_zipped_pickle('train.pkl')
     test_data = load_zipped_pickle('test.pkl')
     print(f"Loaded {len(train_data)} training videos and {len(test_data)} test videos\n")
+
+    for key in test_data[0]:
+        print(f"Key: {key}, Type: {type(test_data[0][key])}")
     
     # Print video sizes for debugging
     print("Training video sizes:")
@@ -316,6 +308,7 @@ def main():
         test_shapes[shape] += 1
     for key, value in test_shapes.items():
         print(f"  Shape {key}: {value} videos")
+    
     print()
     #TODO: choose target size for reshape (make adjustable)
     TARGET_SHAPE = (384, 512)
