@@ -70,7 +70,7 @@ class MitralValveDataset(Dataset):
             for frame_idx in range(num_frames):
                 self.indices.append((item_idx, frame_idx))
         
-        print(f"Loaded {len(self.indices)} samples from {dataset_type.value} dataset")
+        print(f"Loaded {len(self.indices)} sequences from {dataset_type.value} dataset")
     
     def __len__(self):
         return len(self.indices)
@@ -131,10 +131,10 @@ class MitralValveDataset(Dataset):
         box_resized = np.expand_dims(box_resized, axis=0)
         
         return {
-            'frame': torch.from_numpy(seq_resized).float(),
-            'mask': torch.from_numpy(mask_resized).float(),
-            'box': torch.from_numpy(box_resized).float(),
-            'frame_idx': center_idx,
+            'frame': torch.from_numpy(seq_resized).to(torch.float16),
+            'mask': torch.from_numpy(mask_resized).to(torch.bool),
+            'box': torch.from_numpy(box_resized).to(torch.bool),
+            'label_idx': [center_idx], # only one label index for now
             'video_name': item['name']
         }
 
@@ -198,8 +198,8 @@ class TestDataset(Dataset):
         seq_resized = np.expand_dims(seq_resized, axis=0)
         
         return {
-            'frame': torch.from_numpy(seq_resized).float(),
+            'frame': torch.from_numpy(seq_resized).to(torch.float16),
             'name': item['name'],
             'frame_idx': center_idx,
-            'orig_shape': item['video'].shape[:2]  # Store original shape for reverse resize
+            'orig_shape': item['video'].shape[:2]
         }

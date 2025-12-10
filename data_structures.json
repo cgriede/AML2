@@ -10,5 +10,51 @@
   "_test_data_structure": {
     "name": "str, video name",
     "video": "array[height, width, number of frames], video frames"
+  },
+  "_dataset_sizes" : {
+    "training_video_sizes" : {
+      "Shape (112, 112)": 46,
+      "Shape (587, 647)": 1,
+      "Shape (585, 760)": 1,
+      "Shape (730, 772)": 1,
+      "Shape (583, 782)": 1,
+      "Shape (583, 810)": 1,
+      "Shape (579, 844)": 1,
+      "Shape (583, 796)": 1,
+      "Shape (584, 674)": 1,
+      "Shape (731, 765)": 1,
+      "Shape (583, 628)": 1,
+      "Shape (584, 815)": 1,
+      "Shape (731, 834)": 1,
+      "Shape (584, 736)": 1,
+      "Shape (583, 748)": 1,
+      "Shape (583, 784)": 1,
+      "Shape (583, 707)": 1,
+      "Shape (583, 863)": 1,
+      "Shape (583, 743)": 1,
+      "Shape (586, 600)": 1
+    },
+    "test_video_sizes" : {
+      "Shape (112, 112)": 46,
+      "Shape (587, 647)": 1,
+      "Shape (585, 760)": 1,
+      "Shape (730, 772)": 1,
+      "Shape (583, 782)": 1,
+      "Shape (583, 810)": 1,
+      "Shape (579, 844)": 1,
+      "Shape (583, 796)": 1,
+      "Shape (584, 674)": 1,
+      "Shape (731, 765)": 1,
+      "Shape (583, 628)": 1,
+      "Shape (584, 815)": 1,
+      "Shape (731, 834)": 1,
+      "Shape (584, 736)": 1,
+      "Shape (583, 748)": 1,
+      "Shape (583, 784)": 1,
+      "Shape (583, 707)": 1,
+      "Shape (583, 863)": 1,
+      "Shape (583, 743)": 1,
+      "Shape (586, 600)": 1
+    }
   }
 }

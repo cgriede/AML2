@@ -25,27 +25,32 @@ from data_prep import load_zipped_pickle, resize_frame, MitralValveDataset, Test
 # ============================================================================
 # MODEL SETUP
 # ============================================================================
-
 class SegmentationNet(nn.Module):
-    """MedNeXt Small (2D) - processes frames independently with temporal consistency"""
-    
-    def __init__(self, in_channels=1, num_classes=2):
+    """
+    3D MedNeXt for MV segmentation.
+    - Input: (B, 1, 11, H_full, W_full) — full-frame 11-frame clips, normalized [0,1]
+    - Output: (B, 1, H_full, W_full) — logits for CENTER frame only (sigmoid > 0.5 for mask)
+    """
+    def __init__(self, in_channels=1, n_frames=11, model_id='S', kernel_size=3, deep_supervision=False):
         super().__init__()
-        # For binary segmentation (MV vs background)
-        model = create_mednext_v1(
-            num_input_channels=1,      # Grayscale ultrasound frames
-            num_classes=1,             # Binary: sigmoid output
-            model_id='S',
-            kernel_size=3,             # Start small (3x3x3 depthwise)
-            deep_supervision=True      # Helps training on small data
+        self.n_frames = n_frames
+        
+        # Create 3D MedNeXt (spatial_dims=3 treats T as depth)
+        self.backbone = create_mednext_v1(
+            num_input_channels=in_channels,
+            num_classes=1,  # Binary (valve vs bg) — use BCEWithLogitsLoss
+            model_id=model_id,  # 'S' small, 'B' base, 'L' large
+            kernel_size=kernel_size,  # Depthwise kernel: (3,3,3) start small in time
+            deep_supervision=deep_supervision,  # Extra supervision at decoder stages (helps small data)
         )
-        model = model.cuda() if torch.cuda.is_available() else model
-        print(model)  # Inspect layers
-    
-    def forward(self, x):
-        #define input output behaviour
-        return output
+        
+        # We'll handle resizing if needed later (full frames vary in size)
 
+    def forward(self, x):
+        # x: (B, C, T, H, W) — e.g., (4, 1, 11, 512, 512) (Batch size, Number of channels, Number of frames, Height, Width)
+        assert x.shape[2] == self.n_frames, f"Expected {self.n_frames} frames, got {x.shape[2]}"
+        assert x.shape[1] == 1, f"Expected 1 channel, got {x.shape[1]}"
+        return self.backbone(x)
 
 # ============================================================================
 # LOSS FUNCTIONS
@@ -73,7 +78,7 @@ class TemporalSmoothLoss(nn.Module):
     def forward(self, pred):
         # pred shape: (B, 2, H, W, T)
         if pred.shape[-1] < 2:
-            return torch.tensor(0.0, device=pred.device)
+            return torch.tensor(0.0)
         
         # Compare consecutive frame predictions
         smooth_loss = 0.0
@@ -120,20 +125,30 @@ def compute_iou(pred, target):
     return (intersection + 1e-7) / (union + 1e-7)
 
 
-def train_epoch(model, loader, optimizer, loss_fn, device):
+def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
+    #expect pred to be of shape (B, C, T, H, W)
+    return pred[:, :, label_idx, :, :]
+
+
+def train_epoch(model, loader, optimizer, loss_fn):
     model.train()
     total_loss = 0.0
     
     for batch_idx, batch in enumerate(tqdm(loader, desc='Train')):
-        frames = batch['frame'].to(device)
-        masks = batch['mask'].to(device)
+        frames = batch['frame']
+        masks = batch['mask']
+        label_idx = batch['label_idx']
         optimizer.zero_grad()
         try:
             pred = model(frames)
         except Exception as e:
             print(f"[ERROR][train] model forward failed: {e}")
             raise
-        loss = loss_fn(pred, masks)
+        #get the labeled slice only for simple evalutaion of the dice loss
+        #NOTE: might adjust this if we take the temporal loss into account
+        pred_label = slice_tensor_at_label(pred, label_idx)
+        mask_label = slice_tensor_at_label(masks, label_idx)
+        loss = loss_fn(pred_label, mask_label)
         loss.backward()
         optimizer.step()
         
@@ -141,65 +156,75 @@ def train_epoch(model, loader, optimizer, loss_fn, device):
     
     return total_loss / len(loader)
 
+def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: int):
+    best_iou = 0.0
+    patience = 0
+    for epoch in range(n_epochs):
+        train_loss = train_epoch(model, train_loader, optimizer, loss_fn)
+        print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
+        val_loss, val_iou = validate(model, val_loader, loss_fn)
+        print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU={val_iou:.4f}")
+        if val_iou > best_iou:
+            best_iou = val_iou
+            patience = 0
+            torch.save(model.state_dict(), 'best_model.pt') #TODO: save the model
+        else:
+            patience += 1
+            if patience >= 20: #TODO: make this a hyperparameter
+                print("Early stopping")
+                break
+    return model
 
-def validate(model, loader, loss_fn, device):
+
+def validate(model, loader, loss_fn):
     model.eval()
     total_loss = 0.0
     total_iou = 0.0
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc='Val')):
-            frames = batch['frame'].to(device)
-            masks = batch['mask'].to(device)
+            frames = batch['frame']
+            masks = batch['mask']
+            label_idx = batch['label_idx']
             try:
-                pred = model(frames)  # (B, 2, H, W, T)
+                pred = model(frames)  # (B, C, T, H, W)
             except Exception as e:
                 print(f"[ERROR][val] model forward failed: {e}")
                 raise
-            loss = loss_fn(pred, masks)
+            pred_label = slice_tensor_at_label(pred, label_idx)
+            mask_label = slice_tensor_at_label(masks, label_idx)
+            loss = loss_fn(pred_label, mask_label)
             total_loss += loss.item()
             
-            # Use center frame for IoU evaluation
-            center_idx = pred.shape[-1] // 2
-            pred_center = pred[:, :, :, :, center_idx]  # (B, 2, H, W)
-            masks_center = masks[:, :, :, :, center_idx]  # (B, 1, H, W)
-            
-            pred_probs = torch.softmax(pred_center, dim=1)
-            pred_valve = pred_probs[:, 1]
-            
-            iou = compute_iou(pred_valve, masks_center.squeeze(1))
+            iou = compute_iou(pred_label, mask_label)
             total_iou += iou.item()
     
     return total_loss / len(loader), total_iou / len(loader)
 
 
-def predict_test(model, loader, device, test_data):
+def predict_test(model, loader, test_data):
+    raise NotImplementedError("Predict test is not implemented by human")
     """Generate predictions for test set - extract center frame from 3D output"""
     model.eval()
     predictions = {}
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc='Predict')):
-            frames = batch['frame'].to(device)
+            frames = batch['frame']
             names = batch['name']
             frame_indices = batch['frame_idx'].cpu().numpy()
             try:
-                pred = model(frames)  # Shape: (B, 2, H, W, T)
+                pred = model(frames)  # Shape: (B, C, T, H, W)
             except Exception as e:
                 print(f"[ERROR][predict] model forward failed: {e}")
                 raise
-            # Extract center frame from temporal sequence
-            center_idx = pred.shape[-1] // 2
-            pred_center = pred[:, :, :, :, center_idx]  # (B, 2, H, W)
-            
-            pred_probs = torch.softmax(pred_center, dim=1)
-            pred_valve = pred_probs[:, 1].cpu().numpy()
+            pred_label = slice_tensor_at_label(pred, label_idx)
             
             for i, name in enumerate(names):
                 if name not in predictions:
                     predictions[name] = {}
                 
-                predictions[name][int(frame_indices[i])] = pred_valve[i]
+                predictions[name][int(frame_indices[i])] = pred_label[i]
     
     # Reconstruct full video masks at ORIGINAL resolution
     results = {}
@@ -219,6 +244,7 @@ def predict_test(model, loader, device, test_data):
 
 
 def save_submission(predictions, test_data, output_file='submission.csv'):
+    raise NotImplementedError("Save submission is not implemented by human")
     """Save predictions as CSV submission"""
     rows = []
     
@@ -248,133 +274,74 @@ def save_submission(predictions, test_data, output_file='submission.csv'):
     print(f"Submission saved to {output_file}")
 
 
-MACHINE_INFO = {}
-WORKSPACE = "codespace-2"
-
-
-if WORKSPACE == "codespace-2":
-    MACHINE_INFO = {
-        "NUM_CPUS" : 2,
-        "RAM_GB" : 8,
-        "DEVICE" : "cpu"
+MACHINE_CONFIGS = {
+    "codespace-2": {
+        "NUM_CPUS": 2,
+        "RAM_GB": 8,
+        "DEVICE": "cpu"
+    },
+    "surface": {
+        "NUM_CPUS": 4,
+        "RAM_GB": 8,
+        "DEVICE": "cpu"
+    },
+    "home_station": {
+        "NUM_CPUS": 16,
+        "RAM_GB": 64,
+        "DEVICE": "cuda"
     }
-if WORKSPACE == "home_station":
-    MACHINE_INFO = {
-        "NUM_CPUS" : 16,
-        "RAM_GB" : 64,
-        "DEVICE" : "cuda"
-    }
+}
 
+WORKSPACE = "surface"
+MACHINE_INFO = MACHINE_CONFIGS[WORKSPACE]
 
+EVAL = False
 def main():
-    DEVICE = MACHINE_INFO["DEVICE"]
-    print(f"Device: {DEVICE}\n")
+    torch.set_default_device(MACHINE_INFO["DEVICE"])
+    print(f"Device: {MACHINE_INFO['DEVICE']}")
     
     # TODO: Hyperparameters (add dropout, change LR, batch size, etc.)
-    learning_rate = 1e-4
-    n_epochs = 1
+    learning_rate: float = 1e-4
+    n_epochs: int = 1
+    sequence_length: int = 11
+    model_id: str = 'S'
 
     #machine dependant hyperparameters
-    batch_size = 4
+    batch_size: int = 4
+    #technical hyperparameters (should roughly conserve aspect ratio of original pictures, see data_structures.json)
+    TARGET_SHAPE: tuple[int, int] = (384, 512)
     
     # Load data
     train_data = load_zipped_pickle('train.pkl')
-    test_data = load_zipped_pickle('test.pkl')
-    print(f"Loaded {len(train_data)} training videos and {len(test_data)} test videos\n")
+    print(f"Loaded {len(train_data)} training videos\n")
+    if EVAL:
+        print("Evaluating on test set")
+        test_data = load_zipped_pickle('test.pkl')
+        print(f"Loaded {len(test_data)} test videos\n")
 
-    for key in test_data[0]:
-        print(f"Key: {key}, Type: {type(test_data[0][key])}")
-    
-    # Print video sizes for debugging
-    print("Training video sizes:")
-    train_shapes = {}
-    for i, item in enumerate(train_data):
-        shape = item['video'].shape
-        shape = shape[:2]
-        if shape not in train_shapes:
-            train_shapes[shape] = 0
-        train_shapes[shape] += 1
-    for key, value in train_shapes.items():
-        print(f"  Shape {key}: {value} videos")
-    print()
-    
-    print("Test video sizes:")
-    test_shapes = {}
-    for i, item in enumerate(test_data):
-        shape = item['video'].shape
-        shape = shape[:2]
-        if shape not in test_shapes:
-            test_shapes[shape] = 0
-        test_shapes[shape] += 1
-    for key, value in test_shapes.items():
-        print(f"  Shape {key}: {value} videos")
-    
-    print()
-    #TODO: choose target size for reshape (make adjustable)
-    TARGET_SHAPE = (384, 512)
-    #TODO: choose input temporal design (make adjustable)
-
-    #TODO: Create datasets
-    # Training data: use original 112x112 size (no resize needed)
+    # Create datasets
     dataset = MitralValveDataset(train_data, target_size=TARGET_SHAPE)
     num_val = int(0.2 * len(dataset))
     train_ds, val_ds = random_split(dataset, [len(dataset) - num_val, num_val])
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+    
+    if EVAL:
+        test_ds = TestDataset(test_data, target_size=TARGET_SHAPE)
+        test_loader = DataLoader(test_ds, batch_size=batch_size)
+        print(f"Test: {len(test_ds)}")
 
-    #TODO: define the model
-
-    #TODO: evaluate the
-
-    
-    # Test data: resize to 112x112 to match training
-    test_ds = TestDataset(test_data, target_size=(112, 112))
-    print(f"Created datasets: Train={len(train_ds)}, Val={len(val_ds)}, Test={len(test_ds)}")
-
-    
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE)
-    
-    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)}\n")
-    
-    #TODO: model init, instantiate a model
-    # Model
-    model = SegmentationNet().to(DEVICE)
-    #TODO: define the optimizer
-    #optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    
-    #TODO: define the LossFn
-    #loss_fn = HybridLoss()
-    
-    # Training loop
-    best_iou = 0.0
-    patience = 0
-    
-    for epoch in range(NUM_EPOCHS):
-        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, DEVICE)
-        val_loss, val_iou = validate(model, val_loader, loss_fn, DEVICE)
-        
-        print(f"Epoch {epoch+1}: Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, IoU={val_iou:.4f}")
-        
-        if val_iou > best_iou:
-            best_iou = val_iou
-            patience = 0
-            torch.save(model.state_dict(), 'best_model.pt')
-        else:
-            patience += 1
-            if patience >= 20:
-                print("Early stopping")
-                break
-    
-    print(f"\nBest IoU: {best_iou:.4f}")
-    
-    # Load best model
-    model.load_state_dict(torch.load('best_model.pt'))
-    
-    # Predict
-    predictions = predict_test(model, test_loader, DEVICE, test_data)
-    
-    # Submit
-    save_submission(predictions, test_data)
+    # Quick test instantiation (run this to verify)
+    model = SegmentationNet(n_frames=sequence_length, model_id=model_id)
+    loss_fn = DiceLoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    dummy_input = torch.randn(2, 1, sequence_length, TARGET_SHAPE[0], TARGET_SHAPE[1])  # Batch of 2 full-frame clips
+    output = model(dummy_input)
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"Output shape: {output.shape}")  # Should be (2, 1, 512, 512)
+    print(model.backbone)  # Inspect the full architecture
+    model = train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs)
 
 
 if __name__ == '__main__':

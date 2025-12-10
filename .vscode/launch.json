@@ -8,10 +8,10 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "Run solution.py",
+            "name": "Run mednext_pipeline",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/solution.py",
+            "program": "${workspaceFolder}/mednext_pipeline.py",
             "console": "integratedTerminal"
         }
     ]
