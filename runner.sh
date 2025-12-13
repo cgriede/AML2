@@ -1,10 +1,10 @@
 #!/bin/bash
-SBATCH --job-name=mednext_mitral          # Change if you want
-SBATCH --ntasks=8                         # 8 CPU cores (total)
-SBATCH --cpus-per-task=1                  # 1 thread per task (standard for PyTorch CPU training)
-SBATCH --time=24:00:00                    # 24 hours wall-clock time
-SBATCH --output=slurm-%j.out              # Output log file (%j = job ID)
-SBATCH --error=slurm-%j.err               # Error log file
+#SBATCH --job-name=mednext_mitral          # Change if you want
+#SBATCH --ntasks=8                         # 8 CPU cores (total)
+#SBATCH --cpus-per-task=1                  # 1 thread per task (standard for PyTorch CPU training)
+#SBATCH --time=24:00:00                    # 24 hours wall-clock time
+#SBATCH --output=slurm-%j.out              # Output log file (%j = job ID)
+#SBATCH --error=slurm-%j.err               # Error log file
 
 echo "=== Job started at $(date) ==="
 echo "Job ID: $SLURM_JOB_ID"
