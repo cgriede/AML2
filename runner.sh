@@ -11,9 +11,6 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Running on node: $SLURMD_NODENAME"
 echo "Allocated cores: $SLURM_NTASKS"
 
-# Load necessary modules (adjust Python version if needed)
-module load gcc/8.2.0 python_gpu/3.11.6 eth_proxy   # or python/3.11.6 if no GPU needed
-
 # Activate your conda/virtualenv (adjust path/name)
 conda activate AML2
 
