@@ -340,11 +340,11 @@ MACHINE_CONFIGS = {
     }
 }
 
-WORKSPACE = "codespace_4"
+WORKSPACE = "hpc_euler_32"
 MACHINE_INFO = MACHINE_CONFIGS[WORKSPACE]
 
 EVAL = False
-DEBUG = True
+DEBUG = False
 GB_RAM_PER_BATCH = 16
 create_video = True
 
