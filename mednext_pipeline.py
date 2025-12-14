@@ -123,16 +123,15 @@ def compute_iou(pred, target):
 
 
 def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
-    # Expect pred to be of shape (B, C, T, H, W)
-    if torch.is_tensor(label_idx):
-        idx = int(label_idx.flatten()[0].item())
-    elif isinstance(label_idx, (list, tuple)):
-        idx = int(label_idx[0]) if len(label_idx) > 0 else 0
-    else:
-        idx = int(label_idx)
-    # Clamp to valid temporal range to avoid out-of-bounds
-    idx = max(0, min(pred.shape[2] - 1, idx))
-    return pred[:, :, idx, :, :]
+    slices = []
+    for i in range(pred.shape[0]):
+        indices = label_idx[i]
+        if not torch.is_tensor(indices):
+            indices = torch.tensor(indices, device=pred.device, dtype=torch.long)
+        # pred[i:i+1] keeps batch dim for cat compatibility
+        slices.append(pred[i:i+1, :, indices, :, :])   # (1, C, N_i, H, W)
+
+        return torch.cat(slices, dim=0)  # (N_total, C, H, W)
 
 
 def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e3):
@@ -320,7 +319,8 @@ MACHINE_CONFIGS = {
         "NUM_CPUS": 4,
         "RAM_GB": 16,
         "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (1, 1, 16, 208, 272),
+        "MAX_INPUT_SIZE" : (2, 1, 16, 64, 80),
+        #"MAX_INPUT_SIZE" : (1, 1, 16, 208, 272), debug the double batch
     },
     "surface": {
         "NUM_CPUS": 4,

@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import imageio.v2 as imageio
-
+from torch import Tensor
 
 class VideoGenerator:
     """Create GIF overlays for a batch sample.
@@ -60,16 +60,42 @@ class VideoGenerator:
         label_idx_field = batch.get('label_idx')
         self.gt_center_idx = None
         if label_idx_field is not None:
-            # label_idx may be tensor/list/int; normalize
+            # label_idx may be tensor/list of tensors/list of ints/int; normalize
             try:
+                idx_val = None
+                
+                # Handle tensor with batch dimension
                 if hasattr(label_idx_field, 'cpu'):
-                    idx_val = int(np.array(label_idx_field.cpu())[batch_idx].item())
+                    tensor = label_idx_field.cpu()
+                    # Try to index by batch_idx if it has batch dimension
+                    if hasattr(tensor, '__len__') and len(tensor) > batch_idx:
+                        idx_val = int(tensor[batch_idx].item())
+                    else:
+                        idx_val = int(tensor.item())
+                
+                # Handle list/tuple - could contain tensors or scalars
                 elif isinstance(label_idx_field, (list, tuple)):
-                    idx_val = int(label_idx_field[0])
+                    element = label_idx_field[batch_idx]
+                    # Element could be a tensor or scalar
+                    if hasattr(element, 'cpu'):
+                        tensor = element.cpu()
+                        # Handle multi-element tensors by taking first element
+                        if hasattr(tensor, 'numel') and tensor.numel() > 1:
+                            idx_val = int(tensor.flatten()[0].item())
+                        else:
+                            idx_val = int(tensor.item())
+                    elif hasattr(element, 'item'):
+                        idx_val = int(element.item())
+                    else:
+                        idx_val = int(element)
+                
+                # Scalar int
                 else:
                     idx_val = int(label_idx_field)
-                # Clamp
-                self.gt_center_idx = max(0, min(self.T - 1, idx_val))
+                
+                if idx_val is not None:
+                    # Clamp
+                    self.gt_center_idx = max(0, min(self.T - 1, idx_val))
             except Exception:
                 self.gt_center_idx = None
 
