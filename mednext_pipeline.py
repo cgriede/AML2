@@ -14,15 +14,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from torch.amp import autocast, GradScaler
 import pandas as pd
 from tqdm import tqdm
 
 from mednext import create_mednext_v1
-from utils import debug, dimension_scaler
+from utils import debug
 from data_prep import load_zipped_pickle, resize_frame, MitralValveDataset, TestDataset, DatasetType
 from video_generator import VideoGenerator
-from mednext.nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
 
 # ============================================================================
 # MODEL SETUP
@@ -62,44 +60,37 @@ class SegmentationNet(nn.Module):
 # LOSS FUNCTIONS
 # ============================================================================
 
-class DiceLoss(nn.Module):
+class BinaryDiceLoss(nn.Module):
     def __init__(self, smooth=1.0):
         super().__init__()
         self.smooth = smooth
     
     def forward(self, pred, target):
-        pred_prob = torch.softmax(pred, dim=1)
-        pred_flat = pred_prob.view(pred_prob.size(0), pred_prob.size(1), -1)
-        target_flat = target.view(target.size(0), target.size(1), -1)
+        # Flatten all spatial + temporal dimensions (keep batch and channel)
+        pred_flat = pred.view(pred.size(0), pred.size(1), -1)   # → (B, 1, T*H*W)
+        target_flat = target.view(target.size(0), target.size(1), -1)  # → (B, 1, T*H*W)
         
-        intersection = (pred_flat * target_flat).sum(dim=2)
-        union = pred_flat.sum(dim=2) + target_flat.sum(dim=2)
-        
-        dice = (2 * intersection + self.smooth) / (union + self.smooth)
-        return 1 - dice.mean()
+        # Compute intersection and union per batch and channel
+        intersection = (pred_flat * target_flat).sum(dim=2)  # (B, 1)
+        union = pred_flat.sum(dim=2) + target_flat.sum(dim=2)  # (B, 1)
 
+        dice = (2 * intersection + self.smooth) / (union + self.smooth)
+        
+        # Average over batch and channel dimensions to get single scalar loss
+        return 1 - dice.mean()
 
 class TemporalSmoothLoss(nn.Module):
     """Encourages smooth predictions across consecutive frames"""
     def forward(self, pred):
-        # pred shape: (B, 2, H, W, T)
-        if pred.shape[-1] < 2:
-            return torch.tensor(0.0)
-        
-        # Compare consecutive frame predictions
-        smooth_loss = 0.0
-        for t in range(pred.shape[-1] - 1):
-            diff = (pred[:, :, :, :, t] - pred[:, :, :, :, t+1]).abs().mean()
-            smooth_loss += diff
-        
-        return smooth_loss / max(1, pred.shape[-1] - 1)
+        raise NotImplementedError("not implemented by human")
+        return None
 
 
 class HybridLoss(nn.Module):
     def __init__(self, temporal_weight=0.1):
         super().__init__()
         self.ce_loss = nn.CrossEntropyLoss()
-        self.dice_loss = DiceLoss()
+        self.dice_loss = BinaryDiceLoss()
         self.temporal_loss = TemporalSmoothLoss()
         self.temporal_weight = temporal_weight
     
@@ -242,7 +233,7 @@ def validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:
                 except Exception as e:
                     print(f"[ERROR][val] video generation failed:\n {e}")
                     create_video = False
-    
+
     return total_loss / len(loader), total_iou / len(loader)
 
 
@@ -328,7 +319,7 @@ MACHINE_CONFIGS = {
         "NUM_CPUS": 4,
         "RAM_GB": 16,
         "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (1, 1, 16, 208, 272) #float 32 (default)
+        "MAX_INPUT_SIZE" : (1, 1, 16, 208, 272)
     },
     "surface": {
         "NUM_CPUS": 4,
@@ -339,14 +330,21 @@ MACHINE_CONFIGS = {
         "NUM_CPUS": 16,
         "RAM_GB": 64,
         "DEVICE": "cuda"
+    },
+    "hpc_euler_32" : {
+        "NUM_CPUS": 32,
+        "RAM_GB": 32,
+        "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (2, 1, 16, 208, 272)
     }
 }
 
-WORKSPACE = "codespace_4"
+WORKSPACE = "hpc_euler_32"
 MACHINE_INFO = MACHINE_CONFIGS[WORKSPACE]
 
 EVAL = False
-DEBUG = False
+DEBUG = True
+GB_RAM_PER_BATCH = 16
 create_video = True
 
 def main():
@@ -362,7 +360,7 @@ def main():
 
     
     # TODO: Hyperparameters (add dropout, change LR, batch size, etc.)
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-2
     n_epochs: int = 100
     model_id: str = 'S'
 
@@ -389,14 +387,7 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
-
-    train_sample = train_ds[0]
-    for key, item in train_sample.items():
-        print (key)
-        debug(item)
-        print(item)
     
-
     if EVAL:
         test_ds = TestDataset(test_data, target_size=TARGET_SHAPE)
         test_loader = DataLoader(test_ds, batch_size=batch_size)
@@ -404,7 +395,7 @@ def main():
     
     # Quick test instantiation (run this to verify)
     model = SegmentationNet(n_frames=sequence_length, model_id=model_id)
-    loss_fn = DiceLoss()
+    loss_fn = BinaryDiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     model = train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs, create_video, max_batch_per_epoch, max_batch_per_val)
     return None

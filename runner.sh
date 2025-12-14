@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=mednext_mitral
-#SBATCH --ntasks=20
+#SBATCH --ntasks=32
 #SBATCH --cpus-per-task=1
 #SBATCH --time=24:00:00
 
