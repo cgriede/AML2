@@ -10,11 +10,20 @@ from torch.utils.data import Dataset
 from scipy import ndimage
 from enum import Enum
 
-
-def load_zipped_pickle(filename):
-    """Load pickled data from gzip file"""
-    with gzip.open(filename, 'rb') as f:
-        return pickle.load(f)
+def load_pickle(filename):
+    """Load a pickle file, handling both plain .pkl and gzipped .pkl.gz"""
+    with open(filename, 'rb') as f:
+        # Peek at first 2 bytes to check for gzip magic
+        magic = f.read(2)
+        f.seek(0)  # Reset file pointer
+        
+        if magic == b'\x1f\x8b':  # Gzip magic bytes
+            print(f"{filename} is gzipped – decompressing...")
+            with gzip.open(filename, 'rb') as gf:
+                return pickle.load(gf)
+        else:
+            print(f"{filename} is plain pickle (starts with {magic})")
+            return pickle.load(f)
 
 
 def resize_frame(frame, target_size=(128, 128), method='linear'):
