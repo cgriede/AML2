@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from scipy import ndimage
 from enum import Enum
 
-def load_pickle(filename):
+def load_zipped_pickle(filename):
     """Load a pickle file, handling both plain .pkl and gzipped .pkl.gz"""
     with open(filename, 'rb') as f:
         # Peek at first 2 bytes to check for gzip magic
