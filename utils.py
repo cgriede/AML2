@@ -83,7 +83,12 @@ def _debug_method(self):
 
 
 # Add .debug() to common types
-
+def dimension_scaler(multiple:int, aspect_ratio_target: float=1.37, base_size: int = 16):
+    """Generate dimensions that are multiples of `multiple` and roughly match `aspect_ratio_target`"""
+    base_exact = multiple * base_size
+    aspect_factor = aspect_ratio_target * base_exact // base_size
+    aspect_match = int(aspect_factor*base_size)
+    return base_exact, aspect_match
 
 
 # Short alias

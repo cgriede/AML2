@@ -14,13 +14,15 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+from torch.amp import autocast, GradScaler
 import pandas as pd
 from tqdm import tqdm
 
 from mednext import create_mednext_v1
-from utils import debug
+from utils import debug, dimension_scaler
 from data_prep import load_zipped_pickle, resize_frame, MitralValveDataset, TestDataset, DatasetType
-
+from video_generator import VideoGenerator
+from mednext.nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
 
 # ============================================================================
 # MODEL SETUP
@@ -28,8 +30,8 @@ from data_prep import load_zipped_pickle, resize_frame, MitralValveDataset, Test
 class SegmentationNet(nn.Module):
     """
     3D MedNeXt for MV segmentation.
-    - Input: (B, 1, 11, H_full, W_full) — full-frame 11-frame clips, normalized [0,1]
-    - Output: (B, 1, H_full, W_full) — logits for CENTER frame only (sigmoid > 0.5 for mask)
+    - Input: (B, 1, T, H_full, W_full) — full-frame 11-frame clips, normalized [0,1]
+    - Output: (B, 1, T, H_full, W_full) — logits for CENTER frame only (sigmoid > 0.5 for mask)
     """
     def __init__(self, in_channels=1, n_frames=11, model_id='S', kernel_size=3, deep_supervision=False):
         super().__init__()
@@ -48,9 +50,13 @@ class SegmentationNet(nn.Module):
 
     def forward(self, x):
         # x: (B, C, T, H, W) — e.g., (4, 1, 11, 512, 512) (Batch size, Number of channels, Number of frames, Height, Width)
-        assert x.shape[2] == self.n_frames, f"Expected {self.n_frames} frames, got {x.shape[2]}"
-        assert x.shape[1] == 1, f"Expected 1 channel, got {x.shape[1]}"
-        return self.backbone(x)
+        #assert x.shape[2] == self.n_frames, f"Expected {self.n_frames} frames, got {x.shape[2]}"
+        #assert x.shape[1] == 1, f"Expected 1 channel, got {x.shape[1]}"
+        x = self.backbone(x)
+        #apply sigmoid for binary segmentation
+        output = torch.sigmoid(x)
+
+        return output
 
 # ============================================================================
 # LOSS FUNCTIONS
@@ -126,15 +132,28 @@ def compute_iou(pred, target):
 
 
 def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
-    #expect pred to be of shape (B, C, T, H, W)
-    return pred[:, :, label_idx, :, :]
+    # Expect pred to be of shape (B, C, T, H, W)
+    if torch.is_tensor(label_idx):
+        idx = int(label_idx.flatten()[0].item())
+    elif isinstance(label_idx, (list, tuple)):
+        idx = int(label_idx[0]) if len(label_idx) > 0 else 0
+    else:
+        idx = int(label_idx)
+    # Clamp to valid temporal range to avoid out-of-bounds
+    idx = max(0, min(pred.shape[2] - 1, idx))
+    return pred[:, :, idx, :, :]
 
 
-def train_epoch(model, loader, optimizer, loss_fn):
+def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e3):
     model.train()
     total_loss = 0.0
+    batches_per_epoch = 0
     
     for batch_idx, batch in enumerate(tqdm(loader, desc='Train')):
+        batches_per_epoch += 1
+        if batches_per_epoch > max_batch_per_epoch:
+            break
+
         frames = batch['frame']
         masks = batch['mask']
         label_idx = batch['label_idx']
@@ -153,16 +172,21 @@ def train_epoch(model, loader, optimizer, loss_fn):
         optimizer.step()
         
         total_loss += loss.item()
+
     
     return total_loss / len(loader)
 
-def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: int):
+def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: int,
+                create_video: bool=True,
+                max_batch_per_epoch: int = 1e3,
+                max_batch_per_val:int = 1e3,
+                ):
     best_iou = 0.0
     patience = 0
     for epoch in range(n_epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, loss_fn)
+        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, max_batch_per_epoch)
         print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
-        val_loss, val_iou = validate(model, val_loader, loss_fn)
+        val_loss, val_iou = validate(model, val_loader, loss_fn, create_video, max_batch_per_val)
         print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU={val_iou:.4f}")
         if val_iou > best_iou:
             best_iou = val_iou
@@ -176,28 +200,48 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: i
     return model
 
 
-def validate(model, loader, loss_fn):
+def validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:int = 1e3):
     model.eval()
     total_loss = 0.0
     total_iou = 0.0
+    batches_per_val = 0
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc='Val')):
+            batches_per_val += 1
+            if batches_per_val > max_batch_per_val:
+                break
             frames = batch['frame']
             masks = batch['mask']
             label_idx = batch['label_idx']
             try:
-                pred = model(frames)  # (B, C, T, H, W)
+                pred_masks = model(frames)  # (B, C, T, H, W)
             except Exception as e:
                 print(f"[ERROR][val] model forward failed: {e}")
                 raise
-            pred_label = slice_tensor_at_label(pred, label_idx)
-            mask_label = slice_tensor_at_label(masks, label_idx)
-            loss = loss_fn(pred_label, mask_label)
+            pred_label = slice_tensor_at_label(pred_masks, label_idx)
+            true_label = slice_tensor_at_label(masks, label_idx)
+
+            loss = loss_fn(pred_label, true_label)
             total_loss += loss.item()
             
-            iou = compute_iou(pred_label, mask_label)
+            iou = compute_iou(pred_label, true_label)
             total_iou += iou.item()
+            if create_video:
+                try:
+                    # Use full sequence predictions/masks for visualization
+                    vgen = VideoGenerator(
+                        batch,
+                        pred_masks.cpu().numpy(),
+                        masks.cpu().numpy(),
+                        batch_idx=batch_idx,
+                        output_dir="videos",
+                    )
+                    vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
+                    create_video = False #only create one video for debugging purposes
+                except Exception as e:
+                    print(f"[ERROR][val] video generation failed:\n {e}")
+                    create_video = False
     
     return total_loss / len(loader), total_iou / len(loader)
 
@@ -275,10 +319,16 @@ def save_submission(predictions, test_data, output_file='submission.csv'):
 
 
 MACHINE_CONFIGS = {
-    "codespace-2": {
+    "codespace_2": {
         "NUM_CPUS": 2,
         "RAM_GB": 8,
         "DEVICE": "cpu"
+    },
+    "codespace_4": {
+        "NUM_CPUS": 4,
+        "RAM_GB": 16,
+        "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (1, 1, 16, 208, 272) #float 32 (default)
     },
     "surface": {
         "NUM_CPUS": 4,
@@ -292,24 +342,37 @@ MACHINE_CONFIGS = {
     }
 }
 
-WORKSPACE = "surface"
+WORKSPACE = "codespace_4"
 MACHINE_INFO = MACHINE_CONFIGS[WORKSPACE]
 
 EVAL = False
+DEBUG = False
+create_video = True
+
 def main():
     torch.set_default_device(MACHINE_INFO["DEVICE"])
     print(f"Device: {MACHINE_INFO['DEVICE']}")
+
+    if DEBUG:
+        max_batch_per_epoch = 1
+        max_batch_per_val = 1
+    else:
+        max_batch_per_epoch = 1e3
+        max_batch_per_val = 1e3
+
     
     # TODO: Hyperparameters (add dropout, change LR, batch size, etc.)
     learning_rate: float = 1e-4
-    n_epochs: int = 1
-    sequence_length: int = 11
+    n_epochs: int = 100
     model_id: str = 'S'
 
     #machine dependant hyperparameters
-    batch_size: int = 4
-    #technical hyperparameters (should roughly conserve aspect ratio of original pictures, see data_structures.json)
-    TARGET_SHAPE: tuple[int, int] = (384, 512)
+    batch_size: int = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[0]
+    sequence_length: int = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[2]  #default to 16 if not specified
+    #(should roughly conserve aspect ratio of original pictures, see data_structures.json) use utils.dimension_scaler to generate sizes if needed
+    TARGET_SHAPE: tuple[int, int] = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[3:5]
+
+    print(f"Using target shape: {TARGET_SHAPE}, sequence length {sequence_length}, batch size {batch_size}")
     
     # Load data
     train_data = load_zipped_pickle('train.pkl')
@@ -326,22 +389,25 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+
+    train_sample = train_ds[0]
+    for key, item in train_sample.items():
+        print (key)
+        debug(item)
+        print(item)
     
+
     if EVAL:
         test_ds = TestDataset(test_data, target_size=TARGET_SHAPE)
         test_loader = DataLoader(test_ds, batch_size=batch_size)
         print(f"Test: {len(test_ds)}")
-
+    
     # Quick test instantiation (run this to verify)
     model = SegmentationNet(n_frames=sequence_length, model_id=model_id)
     loss_fn = DiceLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    dummy_input = torch.randn(2, 1, sequence_length, TARGET_SHAPE[0], TARGET_SHAPE[1])  # Batch of 2 full-frame clips
-    output = model(dummy_input)
-    print(f"Input shape: {dummy_input.shape}")
-    print(f"Output shape: {output.shape}")  # Should be (2, 1, 512, 512)
-    print(model.backbone)  # Inspect the full architecture
-    model = train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs)
+    model = train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs, create_video, max_batch_per_epoch, max_batch_per_val)
+    return None
 
 
 if __name__ == '__main__':

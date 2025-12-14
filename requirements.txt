@@ -1,9 +1,6 @@
-pickle
-numpy
-pandas
-IPython
-tqdm
-matplotlib
 torch
-torchvision
-ipykernel
+numpy
+matplotlib
+pandas
+scikit-learn
+imageio
