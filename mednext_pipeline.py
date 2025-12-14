@@ -182,7 +182,7 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: i
         if val_iou > best_iou:
             best_iou = val_iou
             patience = 0
-            torch.save(model.state_dict(), 'best_model.pt') #TODO: save the model
+            torch.save(model.state_dict(), 'best_model.pt')
         else:
             patience += 1
             if patience >= 20: #TODO: make this a hyperparameter
@@ -313,33 +313,34 @@ MACHINE_CONFIGS = {
     "codespace_2": {
         "NUM_CPUS": 2,
         "RAM_GB": 8,
-        "DEVICE": "cpu"
+        "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (1, 1, 16, 96, 128),
     },
     "codespace_4": {
         "NUM_CPUS": 4,
         "RAM_GB": 16,
         "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (1, 1, 16, 208, 272)
+        "MAX_INPUT_SIZE" : (1, 1, 16, 208, 272),
     },
     "surface": {
         "NUM_CPUS": 4,
         "RAM_GB": 8,
-        "DEVICE": "cpu"
+        "DEVICE": "cpu",
     },
     "home_station": {
         "NUM_CPUS": 16,
         "RAM_GB": 64,
-        "DEVICE": "cuda"
+        "DEVICE": "cuda",
     },
     "hpc_euler_32" : {
         "NUM_CPUS": 32,
         "RAM_GB": 32,
         "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (2, 1, 16, 208, 272)
+        "MAX_INPUT_SIZE" : (2, 1, 16, 208, 272),
     }
 }
 
-WORKSPACE = "hpc_euler_32"
+WORKSPACE = "codespace_4"
 MACHINE_INFO = MACHINE_CONFIGS[WORKSPACE]
 
 EVAL = False
