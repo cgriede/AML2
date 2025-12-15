@@ -8,7 +8,7 @@ Lean implementation focusing on core ML pipeline:
 - Training loop
 - Inference & submission
 """
-
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -348,6 +348,10 @@ GB_RAM_PER_BATCH = 16
 create_video = True
 
 def main():
+    #MACHINE SPECIFIC SETUP
+    num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
+    torch.set_num_threads(num_threads)
+    print(f"PyTorch using {torch.get_num_threads()} threads")
     torch.set_default_device(MACHINE_INFO["DEVICE"])
     print(f"Device: {MACHINE_INFO['DEVICE']}")
 
