@@ -3,8 +3,8 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-#large data files
-
+#videos
+*.gif
 
 # C extensions
 *.so

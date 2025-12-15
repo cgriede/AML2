@@ -50,9 +50,7 @@ class SegmentationNet(nn.Module):
         # x: (B, C, T, H, W) — e.g., (4, 1, 11, 512, 512) (Batch size, Number of channels, Number of frames, Height, Width)
         #assert x.shape[2] == self.n_frames, f"Expected {self.n_frames} frames, got {x.shape[2]}"
         #assert x.shape[1] == 1, f"Expected 1 channel, got {x.shape[1]}"
-        x = self.backbone(x)
-        #apply sigmoid for binary segmentation
-        output = torch.sigmoid(x)
+        output = self.backbone(x)
 
         return output
 
@@ -65,9 +63,9 @@ class BinaryDiceLoss(nn.Module):
         super().__init__()
         self.smooth = smooth
     
-    def forward(self, pred, target):
+    def forward(self, pred_probs, target):
         # Flatten all spatial + temporal dimensions (keep batch and channel)
-        pred_flat = pred.view(pred.size(0), pred.size(1), -1)   # → (B, 1, T*H*W)
+        pred_flat = pred_probs.view(pred_probs.size(0), pred_probs.size(1), -1)   # → (B, 1, T*H*W)
         target_flat = target.view(target.size(0), target.size(1), -1)  # → (B, 1, T*H*W)
         
         # Compute intersection and union per batch and channel
@@ -80,40 +78,54 @@ class BinaryDiceLoss(nn.Module):
         return 1 - dice.mean()
 
 class TemporalSmoothLoss(nn.Module):
-    """Encourages smooth predictions across consecutive frames"""
-    def forward(self, pred):
-        raise NotImplementedError("not implemented by human")
-        return None
-
-
-class HybridLoss(nn.Module):
-    def __init__(self, temporal_weight=0.1):
+    """Encourages smooth predictions across consecutive frames using L1 on probabilities"""
+    def __init__(self, reduction='mean'):
         super().__init__()
-        self.ce_loss = nn.CrossEntropyLoss()
-        self.dice_loss = BinaryDiceLoss()
-        self.temporal_loss = TemporalSmoothLoss()
-        self.temporal_weight = temporal_weight
+        self.reduction = reduction
     
-    def forward(self, pred, target):
-        # pred shape: (B, 2, H, W, T), target shape: (B, 1, H, W, T)
+    def forward(self, pred):
+        """
+        pred: (B, C, T, H, W) – probabilities (after sigmoid) or logits
+              We recommend applying this on probabilities [0,1] for interpretability.
+        """
+        # Shift pred by one frame along temporal dimension
+        pred_t = pred[:, :, :-1, :, :]   # frames 0 to T-2
+        pred_t_plus_1 = pred[:, :, 1:, :, :]  # frames 1 to T-1
         
-        # For CE/Dice, we average over temporal dimension
-        pred_flat = pred.view(-1, pred.shape[1], pred.shape[2], pred.shape[3])  # (B*T, 2, H, W)
-        target_flat = target.view(-1, 1, target.shape[2], target.shape[3])      # (B*T, 1, H, W)
+        # Absolute difference between consecutive frames
+        diff = torch.abs(pred_t_plus_1 - pred_t)  # (B, C, T-1, H, W)
         
-        target_ce = target_flat.squeeze(1).long()
-        ce = self.ce_loss(pred_flat, target_ce)
-        dice = self.dice_loss(pred_flat, target_flat)
-        
-        # Add temporal smoothness constraint
-        temporal = self.temporal_loss(pred)
-        
-        return 0.45 * ce + 0.45 * dice + self.temporal_weight * temporal
+        # Sum/mean over spatial dims, then over temporal pairs and batch
+        if self.reduction == 'mean':
+            return diff.mean()
+        elif self.reduction == 'sum':
+            return diff.sum()
+        else:
+            raise ValueError("reduction must be 'mean' or 'sum'")
+
+class CombinedLoss(nn.Module):
+    def __init__(self, dice_weight=0.49, bce_weight=0.49, tsl_weight=0.02):
+        super().__init__()
+        self.dice = BinaryDiceLoss()  # Keep your existing one (it works on probs)
+        self.bce = nn.BCEWithLogitsLoss()  # Expects raw logits!
+        self.tsl = TemporalSmoothLoss()
+        self.dice_weight = dice_weight
+        self.bce_weight = bce_weight
+        self.tsl_weight = tsl_weight
+
+    def forward(self, logits, target, label_idx):
+        pred_label = slice_tensor_at_label(logits, label_idx)
+        mask_label = slice_tensor_at_label(target, label_idx)
+        probs = torch.sigmoid(pred_label)  # For Dice
+        dice_loss = self.dice(probs, mask_label)
+        bce_loss = self.bce(pred_label, mask_label.float())
+        temp_loss = self.tsl(torch.sigmoid(logits))
+        return self.dice_weight * dice_loss + self.bce_weight * bce_loss + self.tsl_weight * temp_loss
 
 
-def compute_iou(pred, target):
+def compute_iou(pred_probs, target):
     """Jaccard Index (IoU)"""
-    pred_binary = (pred > 0.5).float()
+    pred_binary = (pred_probs > 0.5).float()
     target_binary = target.float()
     
     intersection = (pred_binary * target_binary).sum()
@@ -123,16 +135,15 @@ def compute_iou(pred, target):
 
 
 def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
-    # Expect pred to be of shape (B, C, T, H, W)
-    if torch.is_tensor(label_idx):
-        idx = int(label_idx.flatten()[0].item())
-    elif isinstance(label_idx, (list, tuple)):
-        idx = int(label_idx[0]) if len(label_idx) > 0 else 0
-    else:
-        idx = int(label_idx)
-    # Clamp to valid temporal range to avoid out-of-bounds
-    idx = max(0, min(pred.shape[2] - 1, idx))
-    return pred[:, :, idx, :, :]
+    slices = []
+    for i in range(pred.shape[0]):
+        indices = label_idx[i]
+        if not torch.is_tensor(indices):
+            indices = torch.tensor(indices, device=pred.device, dtype=torch.long)
+        # pred[i:i+1] keeps batch dim for cat compatibility
+        slices.append(pred[i:i+1, :, indices, :, :])   # (1, C, N_i, H, W)
+
+    return torch.cat(slices, dim=0)  # (N_total, C, H, W)
 
 
 def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e3):
@@ -146,7 +157,7 @@ def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e
             break
 
         frames = batch['frame']
-        masks = batch['mask']
+        target = batch['mask']
         label_idx = batch['label_idx']
         optimizer.zero_grad()
         try:
@@ -156,9 +167,8 @@ def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e
             raise
         #get the labeled slice only for simple evalutaion of the dice loss
         #NOTE: might adjust this if we take the temporal loss into account
-        pred_label = slice_tensor_at_label(pred, label_idx)
-        mask_label = slice_tensor_at_label(masks, label_idx)
-        loss = loss_fn(pred_label, mask_label)
+
+        loss = loss_fn(pred, target, label_idx)
         loss.backward()
         optimizer.step()
         
@@ -177,12 +187,24 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: i
     for epoch in range(n_epochs):
         train_loss = train_epoch(model, train_loader, optimizer, loss_fn, max_batch_per_epoch)
         print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
-        val_loss, val_iou = validate(model, val_loader, loss_fn, create_video, max_batch_per_val)
+        val_loss, val_iou, video_payload = validate(model, val_loader, loss_fn, create_video, max_batch_per_val)
         print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU={val_iou:.4f}")
         if val_iou > best_iou:
             best_iou = val_iou
             patience = 0
-            torch.save(model.state_dict(), 'best_model.pt') #TODO: save the model
+            torch.save(model.state_dict(), 'best_model.pt')
+            if create_video and video_payload is not None:
+                try:
+                    vgen = VideoGenerator(
+                        video_payload["batch"],
+                        video_payload["pred_masks"],
+                        video_payload["true_masks"],
+                        batch_idx=video_payload["batch_idx"],
+                        output_dir="videos",
+                    )
+                    vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
+                except Exception as e:
+                    print(f"[ERROR][train] video generation failed:\n {e}")
         else:
             patience += 1
             if patience >= 20: #TODO: make this a hyperparameter
@@ -196,6 +218,7 @@ def validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:
     total_loss = 0.0
     total_iou = 0.0
     batches_per_val = 0
+    video_payload = None
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(loader, desc='Val')):
@@ -203,38 +226,31 @@ def validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:
             if batches_per_val > max_batch_per_val:
                 break
             frames = batch['frame']
-            masks = batch['mask']
+            target = batch['mask']
             label_idx = batch['label_idx']
             try:
-                pred_masks = model(frames)  # (B, C, T, H, W)
+                pred = model(frames)  # (B, C, T, H, W)
             except Exception as e:
                 print(f"[ERROR][val] model forward failed: {e}")
                 raise
-            pred_label = slice_tensor_at_label(pred_masks, label_idx)
-            true_label = slice_tensor_at_label(masks, label_idx)
 
-            loss = loss_fn(pred_label, true_label)
+            loss = loss_fn(pred, target, label_idx)
             total_loss += loss.item()
-            
-            iou = compute_iou(pred_label, true_label)
-            total_iou += iou.item()
-            if create_video:
-                try:
-                    # Use full sequence predictions/masks for visualization
-                    vgen = VideoGenerator(
-                        batch,
-                        pred_masks.cpu().numpy(),
-                        masks.cpu().numpy(),
-                        batch_idx=batch_idx,
-                        output_dir="videos",
-                    )
-                    vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
-                    create_video = False #only create one video for debugging purposes
-                except Exception as e:
-                    print(f"[ERROR][val] video generation failed:\n {e}")
-                    create_video = False
 
-    return total_loss / len(loader), total_iou / len(loader)
+            pred_probs = torch.sigmoid(slice_tensor_at_label(pred, label_idx))
+            
+            iou = compute_iou(pred_probs, slice_tensor_at_label(target, label_idx))
+            total_iou += iou.item()
+            if create_video and video_payload is None:
+                # Capture first available batch for potential video generation
+                video_payload = {
+                    "batch": batch,
+                    "pred_masks": pred.cpu().numpy(),
+                    "true_masks": target.cpu().numpy(),
+                    "batch_idx": batch_idx,
+                }
+
+    return total_loss / len(loader), total_iou / len(loader), video_payload
 
 
 def predict_test(model, loader, test_data):
@@ -313,33 +329,35 @@ MACHINE_CONFIGS = {
     "codespace_2": {
         "NUM_CPUS": 2,
         "RAM_GB": 8,
-        "DEVICE": "cpu"
+        "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (1, 1, 16, 96, 128),
     },
     "codespace_4": {
         "NUM_CPUS": 4,
         "RAM_GB": 16,
         "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (1, 1, 16, 208, 272)
+        "MAX_INPUT_SIZE" : (2, 1, 16, 64, 80),
+        #"MAX_INPUT_SIZE" : (1, 1, 16, 208, 272), debug the double batch
     },
     "surface": {
         "NUM_CPUS": 4,
         "RAM_GB": 8,
-        "DEVICE": "cpu"
+        "DEVICE": "cpu",
     },
     "home_station": {
         "NUM_CPUS": 16,
         "RAM_GB": 64,
-        "DEVICE": "cuda"
+        "DEVICE": "cuda",
     },
     "hpc_euler_32" : {
         "NUM_CPUS": 32,
         "RAM_GB": 32,
         "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (2, 1, 16, 208, 272)
+        "MAX_INPUT_SIZE" : (2, 1, 16, 208, 272),
     }
 }
 
-WORKSPACE = "hpc_euler_32"
+WORKSPACE = "codespace_4"
 MACHINE_INFO = MACHINE_CONFIGS[WORKSPACE]
 
 EVAL = False
@@ -364,7 +382,7 @@ def main():
 
     
     # TODO: Hyperparameters (add dropout, change LR, batch size, etc.)
-    learning_rate: float = 1e-2
+    learning_rate: float = 1e-3
     n_epochs: int = 100
     model_id: str = 'S'
 
@@ -399,7 +417,7 @@ def main():
     
     # Quick test instantiation (run this to verify)
     model = SegmentationNet(n_frames=sequence_length, model_id=model_id)
-    loss_fn = BinaryDiceLoss()
+    loss_fn = CombinedLoss(dice_weight=0.5, bce_weight=0.5)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     model = train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs, create_video, max_batch_per_epoch, max_batch_per_val)
     return None
