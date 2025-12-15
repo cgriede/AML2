@@ -1,4 +1,4 @@
-from nnunet_mednext.network_architecture.mednextv1.MedNextV1 import MedNeXt
+from .MedNextV1 import MedNeXt
 
 def create_mednextv1_small(num_input_channels, num_classes, kernel_size=3, ds=False):
 

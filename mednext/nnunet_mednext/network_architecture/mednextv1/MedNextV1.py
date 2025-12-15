@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
-from nnunet_mednext.network_architecture.mednextv1.blocks import *
+from .blocks import *
 
 class MedNeXt(nn.Module):
 
