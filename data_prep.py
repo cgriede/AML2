@@ -146,7 +146,7 @@ class MitralValveDataset(Dataset):
             'frame': torch.from_numpy(seq_resized),
             'mask': torch.from_numpy(mask_resized),
             'box': torch.from_numpy(box_resized),
-            'label_idx': [sequence_label_idx], # only one label index for now
+            'label_idx': sequence_label_idx, # only one label index for now
             'video_name': item['name']
         }
 
