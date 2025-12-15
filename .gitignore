@@ -6,6 +6,9 @@ __pycache__/
 #videos
 *.gif
 
+#pytorch models
+*.pt
+
 # C extensions
 *.so
 
