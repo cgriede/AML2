@@ -103,24 +103,42 @@ class TemporalSmoothLoss(nn.Module):
         else:
             raise ValueError("reduction must be 'mean' or 'sum'")
 
+class AreaConsistencyLoss(nn.Module):
+    def __init__(self, weight=0.05):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, probs):  # probs = sigmoid(logits), shape (B, 1, T, H, W)
+        # Sum foreground probability mass per frame in batch
+        areas = probs.sum(dim=[2,3,4])  # → (B,)
+        # Penalize large changes between consecutive frames in batch (approximation)
+        if areas.shape[0] > 1:
+            diff = torch.abs(areas[1:] - areas[:-1])
+            return self.weight * diff.mean()
+        return 0.0 * areas.sum()  # 0 if batch=1
+
 class CombinedLoss(nn.Module):
-    def __init__(self, dice_weight=0.49, bce_weight=0.49, tsl_weight=0.02):
+    def __init__(self, dice_weight=0.48, bce_weight=0.48, tsl_weight=0.02, ac_weight=0.02):
         super().__init__()
         self.dice = BinaryDiceLoss()  # Keep your existing one (it works on probs)
         self.bce = nn.BCEWithLogitsLoss()  # Expects raw logits!
         self.tsl = TemporalSmoothLoss()
+        self.ac = AreaConsistencyLoss()
         self.dice_weight = dice_weight
         self.bce_weight = bce_weight
         self.tsl_weight = tsl_weight
+        self.ac_weight = ac_weight
 
     def forward(self, logits, target, label_idx):
         pred_label = slice_tensor_at_label(logits, label_idx)
         mask_label = slice_tensor_at_label(target, label_idx)
-        probs = torch.sigmoid(pred_label)  # For Dice
-        dice_loss = self.dice(probs, mask_label)
+        probs_label = torch.sigmoid(pred_label)  # For Dice
+        probs = torch.sigmoid(logits)
+        dice_loss = self.dice(probs_label, mask_label)
         bce_loss = self.bce(pred_label, mask_label.float())
-        temp_loss = self.tsl(torch.sigmoid(logits))
-        return self.dice_weight * dice_loss + self.bce_weight * bce_loss + self.tsl_weight * temp_loss
+        temp_loss = self.tsl(probs)
+        ac_loss = self.ac(probs)
+        return self.dice_weight * dice_loss + self.bce_weight * bce_loss + self.tsl_weight * temp_loss + self.ac_weight * ac_loss
 
 
 def compute_iou(pred_probs, target):
@@ -207,7 +225,7 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: i
                     print(f"[ERROR][train] video generation failed:\n {e}")
         else:
             patience += 1
-            if patience >= 20: #TODO: make this a hyperparameter
+            if patience >= 50: #TODO: make this a hyperparameter
                 print("Early stopping")
                 break
     return model
@@ -343,6 +361,7 @@ MACHINE_CONFIGS = {
         "NUM_CPUS": 4,
         "RAM_GB": 8,
         "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (2, 1, 16, 64, 80),
     },
     "home_station": {
         "NUM_CPUS": 16,
@@ -402,10 +421,11 @@ def main():
         test_data = load_zipped_pickle('test.pkl')
         print(f"Loaded {len(test_data)} test videos\n")
 
-    # Create datasets
-    dataset = MitralValveDataset(train_data, target_size=TARGET_SHAPE)
-    num_val = int(0.2 * len(dataset))
-    train_ds, val_ds = random_split(dataset, [len(dataset) - num_val, num_val])
+    # Split the raw data before creating the dataset from sequences
+    num_val = int(0.2 * len(train_data))
+    train_split, val_split = random_split(train_data, [len(train_data) - num_val, num_val])
+    train_ds = MitralValveDataset(train_split, target_size=TARGET_SHAPE)
+    val_ds = MitralValveDataset(val_split, target_size=TARGET_SHAPE)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
