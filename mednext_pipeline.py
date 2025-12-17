@@ -119,7 +119,12 @@ class AreaConsistencyLoss(nn.Module):
 
 @torch.compile
 class CombinedLoss(nn.Module):
-    def __init__(self, dice_weight=0.48, bce_weight=0.48, tsl_weight=0.02, ac_weight=0.02):
+    def __init__(self,
+      dice_weight: float=50,
+      bce_weight : float=50,
+      tsl_weight : float=1,
+      ac_weight  : float=0.1
+    ) -> None    : 
         super().__init__()
         self.dice = BinaryDiceLoss()  # Keep your existing one (it works on probs)
         self.bce = nn.BCEWithLogitsLoss()  # Expects raw logits!
