@@ -117,6 +117,7 @@ class AreaConsistencyLoss(nn.Module):
             return self.weight * diff.mean()
         return 0.0 * areas.sum()  # 0 if batch=1
 
+@torch.compile
 class CombinedLoss(nn.Module):
     def __init__(self, dice_weight=0.48, bce_weight=0.48, tsl_weight=0.02, ac_weight=0.02):
         super().__init__()
@@ -124,10 +125,11 @@ class CombinedLoss(nn.Module):
         self.bce = nn.BCEWithLogitsLoss()  # Expects raw logits!
         self.tsl = TemporalSmoothLoss()
         self.ac = AreaConsistencyLoss()
-        self.dice_weight = dice_weight
-        self.bce_weight = bce_weight
-        self.tsl_weight = tsl_weight
-        self.ac_weight = ac_weight
+        total_weight = dice_weight + bce_weight + tsl_weight + ac_weight #automatically normalize the weights to 1
+        self.dice_weight = dice_weight / total_weight
+        self.bce_weight = bce_weight / total_weight
+        self.tsl_weight = tsl_weight / total_weight
+        self.ac_weight = ac_weight / total_weight
 
     def forward(self, logits, target, label_idx):
         pred_label = slice_tensor_at_label(logits, label_idx)
@@ -163,7 +165,7 @@ def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Ten
 
     return torch.cat(slices, dim=0)  # (N_total, C, H, W)
 
-
+@torch.compile
 def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e3):
     model.train()
     total_loss = 0.0
@@ -195,6 +197,7 @@ def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e
     
     return total_loss / len(loader)
 
+@torch.compile
 def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: int,
                 create_video: bool=True,
                 max_batch_per_epoch: int = 1e3,
@@ -231,6 +234,7 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: i
     return model
 
 
+@torch.compile
 def validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:int = 1e3):
     model.eval()
     total_loss = 0.0
@@ -436,8 +440,8 @@ def main():
         print(f"Test: {len(test_ds)}")
     
     # Quick test instantiation (run this to verify)
-    model = SegmentationNet(n_frames=sequence_length, model_id=model_id)
-    loss_fn = CombinedLoss(dice_weight=0.5, bce_weight=0.5)
+    model = SegmentationNet(n_frames=sequence_length, model_id=model_id).compile()
+    loss_fn = CombinedLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     model = train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs, create_video, max_batch_per_epoch, max_batch_per_val)
     return None
