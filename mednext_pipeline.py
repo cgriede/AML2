@@ -9,6 +9,7 @@ Lean implementation focusing on core ML pipeline:
 - Inference & submission
 """
 import os
+from tkinter.constants import FALSE
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,6 +22,67 @@ from mednext import create_mednext_v1
 from utils import debug
 from data_prep import load_zipped_pickle, resize_frame, MitralValveDataset, TestDataset, DatasetType
 from video_generator import VideoGenerator
+
+
+
+MACHINE_CONFIGS = {
+    "codespace_2": {
+        "NUM_CPUS": 2,
+        "RAM_GB": 8,
+        "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (1, 1, 16, 96, 128),
+    },
+    "codespace_4": {
+        "NUM_CPUS": 4,
+        "RAM_GB": 16,
+        "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (2, 1, 16, 64, 80),
+        #"MAX_INPUT_SIZE" : (1, 1, 16, 208, 272), debug the double batch
+    },
+    "surface": {
+        "NUM_CPUS": 4,
+        "RAM_GB": 8,
+        "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (2, 1, 16, 64, 80),
+    },
+    "home_station": {
+        "NUM_CPUS": 16,
+        "RAM_GB": 64,
+        "DEVICE": "cuda",
+        "MAX_INPUT_SIZE" : (1, 1, 16, 320, 432),
+    },
+    "hpc_euler_32" : {
+        "NUM_CPUS": 32,
+        "RAM_GB": 32,
+        "DEVICE": "cpu",
+        "MAX_INPUT_SIZE" : (2, 1, 16, 208, 272),
+    }
+}
+
+DEVICE = "cpu"
+WORKSPACE = "home_station"
+MACHINE_INFO = MACHINE_CONFIGS[WORKSPACE]
+
+
+#MACHINE SPECIFIC SETUP
+if WORKSPACE.startswith("hpc"):
+    num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
+else:
+    num_threads = max(1, os.cpu_count() // 2)
+torch.set_num_threads(num_threads)
+print(f"PyTorch using {torch.get_num_threads()} threads")
+
+# Check CUDA availability before setting device
+requested_device = MACHINE_INFO["DEVICE"]
+if requested_device == "cuda" and not torch.cuda.is_available():
+    print(f"Warning: CUDA requested but not available. Falling back to CPU.")
+    DEVICE = "cpu"
+else:
+    DEVICE = requested_device
+print(f"Device: {DEVICE}")
+if DEVICE == "cuda":
+    print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
+    
 
 # ============================================================================
 # MODEL SETUP
@@ -104,7 +166,7 @@ class TemporalSmoothLoss(nn.Module):
             raise ValueError("reduction must be 'mean' or 'sum'")
 
 class AreaConsistencyLoss(nn.Module):
-    def __init__(self, weight=0.05):
+    def __init__(self, weight=0.01):
         super().__init__()
         self.weight = weight
 
@@ -117,13 +179,12 @@ class AreaConsistencyLoss(nn.Module):
             return self.weight * diff.mean()
         return 0.0 * areas.sum()  # 0 if batch=1
 
-@torch.compile
 class CombinedLoss(nn.Module):
     def __init__(self,
       dice_weight: float=50,
       bce_weight : float=50,
       tsl_weight : float=1,
-      ac_weight  : float=0.1
+      ac_weight  : float=0.5
     ) -> None    : 
         super().__init__()
         self.dice = BinaryDiceLoss()  # Keep your existing one (it works on probs)
@@ -170,7 +231,6 @@ def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Ten
 
     return torch.cat(slices, dim=0)  # (N_total, C, H, W)
 
-@torch.compile
 def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e3):
     model.train()
     total_loss = 0.0
@@ -181,9 +241,9 @@ def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e
         if batches_per_epoch > max_batch_per_epoch:
             break
 
-        frames = batch['frame']
-        target = batch['mask']
-        label_idx = batch['label_idx']
+        frames = batch['frame'].to(DEVICE)
+        target = batch['mask'].to(DEVICE)
+        label_idx = batch['label_idx'].to(DEVICE)
         optimizer.zero_grad()
         try:
             pred = model(frames)
@@ -202,7 +262,6 @@ def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e
     
     return total_loss / len(loader)
 
-@torch.compile
 def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: int,
                 create_video: bool=True,
                 max_batch_per_epoch: int = 1e3,
@@ -239,7 +298,6 @@ def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: i
     return model
 
 
-@torch.compile
 def validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:int = 1e3):
     model.eval()
     total_loss = 0.0
@@ -252,14 +310,11 @@ def validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:
             batches_per_val += 1
             if batches_per_val > max_batch_per_val:
                 break
-            frames = batch['frame']
-            target = batch['mask']
-            label_idx = batch['label_idx']
-            try:
-                pred = model(frames)  # (B, C, T, H, W)
-            except Exception as e:
-                print(f"[ERROR][val] model forward failed: {e}")
-                raise
+            frames = batch['frame'].to(DEVICE)
+            target = batch['mask'].to(DEVICE)
+            label_idx = batch['label_idx'].to(DEVICE)
+            pred = model(frames)  # (B, C, T, H, W)
+
 
             loss = loss_fn(pred, target, label_idx)
             total_loss += loss.item()
@@ -352,54 +407,11 @@ def save_submission(predictions, test_data, output_file='submission.csv'):
     print(f"Submission saved to {output_file}")
 
 
-MACHINE_CONFIGS = {
-    "codespace_2": {
-        "NUM_CPUS": 2,
-        "RAM_GB": 8,
-        "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (1, 1, 16, 96, 128),
-    },
-    "codespace_4": {
-        "NUM_CPUS": 4,
-        "RAM_GB": 16,
-        "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (2, 1, 16, 64, 80),
-        #"MAX_INPUT_SIZE" : (1, 1, 16, 208, 272), debug the double batch
-    },
-    "surface": {
-        "NUM_CPUS": 4,
-        "RAM_GB": 8,
-        "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (2, 1, 16, 64, 80),
-    },
-    "home_station": {
-        "NUM_CPUS": 16,
-        "RAM_GB": 64,
-        "DEVICE": "cuda",
-    },
-    "hpc_euler_32" : {
-        "NUM_CPUS": 32,
-        "RAM_GB": 32,
-        "DEVICE": "cpu",
-        "MAX_INPUT_SIZE" : (2, 1, 16, 208, 272),
-    }
-}
-
-WORKSPACE = "hpc_euler_32"
-MACHINE_INFO = MACHINE_CONFIGS[WORKSPACE]
-
-EVAL = False
-DEBUG = False
-GB_RAM_PER_BATCH = 16
-create_video = True
-
 def main():
-    #MACHINE SPECIFIC SETUP
-    num_threads = int(os.environ.get("OMP_NUM_THREADS", "1"))
-    torch.set_num_threads(num_threads)
-    print(f"PyTorch using {torch.get_num_threads()} threads")
-    torch.set_default_device(MACHINE_INFO["DEVICE"])
-    print(f"Device: {MACHINE_INFO['DEVICE']}")
+    EVAL = False
+    DEBUG = FALSE
+    GB_RAM_PER_BATCH = 16
+    create_video = True
 
     if DEBUG:
         max_batch_per_epoch = 1
@@ -432,21 +444,24 @@ def main():
 
     # Split the raw data before creating the dataset from sequences
     num_val = int(0.2 * len(train_data))
+    # Create generator with correct device to avoid device mismatch error
     train_split, val_split = random_split(train_data, [len(train_data) - num_val, num_val])
     train_ds = MitralValveDataset(train_split, target_size=TARGET_SHAPE)
     val_ds = MitralValveDataset(val_split, target_size=TARGET_SHAPE)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,)
+    val_loader = DataLoader(val_ds, batch_size=batch_size,)
     
     if EVAL:
         test_ds = TestDataset(test_data, target_size=TARGET_SHAPE)
-        test_loader = DataLoader(test_ds, batch_size=batch_size)
+        test_loader = DataLoader(test_ds, batch_size=batch_size,)
         print(f"Test: {len(test_ds)}")
     
     # Quick test instantiation (run this to verify)
-    model = SegmentationNet(n_frames=sequence_length, model_id=model_id).compile()
-    loss_fn = CombinedLoss()
+    model = SegmentationNet(n_frames=sequence_length, model_id=model_id).to(DEVICE)
+
+    loss_fn = CombinedLoss().to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     model = train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs, create_video, max_batch_per_epoch, max_batch_per_val)
     return None

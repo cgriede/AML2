@@ -93,3 +93,13 @@ def dimension_scaler(multiple:int, aspect_ratio_target: float=1.37, base_size: i
 
 # Short alias
 d = debug
+
+if __name__ == "__main__":
+    x, y = dimension_scaler(15)
+    print(x, y, "n_voxels", f"{x * y:.3e}")
+    
+    x, y = dimension_scaler(12)
+    print(x, y, "n_voxels", f"{x * y:.3e}")
+    
+    x, y = dimension_scaler(20)
+    print(x, y, "n_voxels", f"{x * y:.3e}")
