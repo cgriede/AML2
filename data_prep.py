@@ -9,6 +9,8 @@ import pickle
 from torch.utils.data import Dataset
 from scipy import ndimage
 from enum import Enum
+import random
+
 
 def load_zipped_pickle(filename):
     """Load a pickle file, handling both plain .pkl and gzipped .pkl.gz"""
@@ -58,9 +60,19 @@ class DatasetType(Enum):
 class MitralValveDataset(Dataset):
     """Load temporal sequences from train.pkl - lazy loading, compute on demand"""
     
-    def __init__(self, data_list, seq_len: int=16, target_size: tuple=None, dataset_type: DatasetType=DatasetType.EXPERT):
+    #TODO: make label_position random
+    def __init__(self, data_list,
+    seq_len: int=16,
+    random_label_position: bool=False,
+    rotation_chance: float=0.0,
+    rotation_angle: float=20,
+    target_size: tuple=None,
+    dataset_type: DatasetType=DatasetType.EXPERT):
         self.data_list = data_list
         self.seq_len = seq_len
+        self.random_label_position = random_label_position
+        self.rotation_chance = rotation_chance
+        self.rotation_angle = rotation_angle
         self.target_size = target_size
         self.dataset_type = dataset_type
         self.indices = []  # Store (item_idx, frame_idx) pairs
@@ -85,6 +97,7 @@ class MitralValveDataset(Dataset):
         return len(self.indices)
     
     def __getitem__(self, idx):
+
         item_idx, center_idx = self.indices[idx]
         item = self.data_list[item_idx]
         
@@ -93,18 +106,33 @@ class MitralValveDataset(Dataset):
         label = item['label'].astype(np.bool_)
         box = item['box'].astype(np.bool_)
         num_frames = video.shape[2]
-        
-        # Get seq_len consecutive frames centered on frame
-        half_seq = self.seq_len // 2
-        start_idx = center_idx - half_seq
-        # the index of the label in the returned sequence (not full video)
-        sequence_label_idx = center_idx - start_idx
-        
+
+        # Choose label position in sequence
+        if self.random_label_position:
+            sequence_label_idx = random.randint(0, self.seq_len - 1)
+            # The frame in the source video to use at this label_idx
+            start_idx = center_idx - sequence_label_idx
+        else:
+            half_seq = self.seq_len // 2
+            start_idx = center_idx - half_seq
+            sequence_label_idx = center_idx - start_idx
+
         # Extract frames with reflective padding
         # Time-first layout so frames are stored as [t, h, w]
         seq = np.zeros((self.seq_len, video.shape[0], video.shape[1]), dtype=np.float32)
         mask_seq = np.zeros((self.seq_len, label.shape[0], label.shape[1]), dtype=np.bool)
-        
+
+        if np.random.uniform(0, 1) < self.rotation_chance and self.rotation_chance > 1e-20:
+            # Rotate frames by random angle up to 20 degrees
+            angle    = np.random.uniform(-20, 20)
+            seq      = ndimage.rotate(seq, angle, axes=(1, 2), reshape=False)
+            mask_seq = ndimage.rotate(mask_seq, angle, axes=(1, 2), reshape=False)
+            # box is 2D (H, W), so use axes=(0, 1) instead of (1, 2)
+            box      = ndimage.rotate(box, angle, axes=(0, 1), reshape=False)
+            # Safety: Re-threshold to binary (concept: eliminate float artifacts)
+            mask_seq = (mask_seq > 0.5).astype(np.bool_)
+            box = (box > 0.5).astype(np.bool_)
+
         for t in range(self.seq_len):
             frame_t = start_idx + t
             
@@ -146,7 +174,7 @@ class MitralValveDataset(Dataset):
             'frame': torch.from_numpy(seq_resized),
             'mask': torch.from_numpy(mask_resized),
             'box': torch.from_numpy(box_resized),
-            'label_idx': sequence_label_idx, # only one label index for now
+            'label_idx': sequence_label_idx,  # index of the label in the returned sequence
             'video_name': item['name']
         }
 

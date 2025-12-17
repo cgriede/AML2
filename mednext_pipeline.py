@@ -9,7 +9,6 @@ Lean implementation focusing on core ML pipeline:
 - Inference & submission
 """
 import os
-from tkinter.constants import FALSE
 import numpy as np
 import torch
 import torch.nn as nn
@@ -17,6 +16,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 import pandas as pd
 from tqdm import tqdm
+from pathlib import Path
 
 from mednext import create_mednext_v1
 from utils import debug
@@ -49,7 +49,8 @@ MACHINE_CONFIGS = {
         "NUM_CPUS": 16,
         "RAM_GB": 64,
         "DEVICE": "cuda",
-        "MAX_INPUT_SIZE" : (1, 1, 16, 320, 432),
+        "MAX_INPUT_SIZE" : (1, 1, 16, 160, 224),  #high performance, for fast dev
+        #"MAX_INPUT_SIZE" : (1, 1, 16, 320, 432), #works with high res, 8s / sample
     },
     "hpc_euler_32" : {
         "NUM_CPUS": 32,
@@ -82,7 +83,14 @@ else:
 print(f"Device: {DEVICE}")
 if DEVICE == "cuda":
     print(f"CUDA Device: {torch.cuda.get_device_name(0)}")
-    
+
+
+#machine dependant hyperparameters
+batch_size: int = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[0]
+sequence_length: int = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[2]  #default to 16 if not specified
+#(should roughly conserve aspect ratio of original pictures, see data_structures.json) use utils.dimension_scaler to generate sizes if needed
+TARGET_SHAPE: tuple[int, int] = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[3:5]
+
 
 # ============================================================================
 # MODEL SETUP
@@ -179,237 +187,263 @@ class AreaConsistencyLoss(nn.Module):
             return self.weight * diff.mean()
         return 0.0 * areas.sum()  # 0 if batch=1
 
-class CombinedLoss(nn.Module):
-    def __init__(self,
-      dice_weight: float=50,
-      bce_weight : float=50,
-      tsl_weight : float=1,
-      ac_weight  : float=0.5
-    ) -> None    : 
-        super().__init__()
-        self.dice = BinaryDiceLoss()  # Keep your existing one (it works on probs)
-        self.bce = nn.BCEWithLogitsLoss()  # Expects raw logits!
-        self.tsl = TemporalSmoothLoss()
-        self.ac = AreaConsistencyLoss()
-        total_weight = dice_weight + bce_weight + tsl_weight + ac_weight #automatically normalize the weights to 1
-        self.dice_weight = dice_weight / total_weight
-        self.bce_weight = bce_weight / total_weight
-        self.tsl_weight = tsl_weight / total_weight
-        self.ac_weight = ac_weight / total_weight
 
-    def forward(self, logits, target, label_idx):
-        pred_label = slice_tensor_at_label(logits, label_idx)
-        mask_label = slice_tensor_at_label(target, label_idx)
-        probs_label = torch.sigmoid(pred_label)  # For Dice
-        probs = torch.sigmoid(logits)
-        dice_loss = self.dice(probs_label, mask_label)
-        bce_loss = self.bce(pred_label, mask_label.float())
-        temp_loss = self.tsl(probs)
-        ac_loss = self.ac(probs)
-        return self.dice_weight * dice_loss + self.bce_weight * bce_loss + self.tsl_weight * temp_loss + self.ac_weight * ac_loss
+class SegmentationTrainer:
 
+    class CombinedLoss(nn.Module):
+        def __init__(self,
+        dice_weight: float=50,
+        bce_weight : float=50,
+        tsl_weight : float=1,
+        ac_weight  : float=0.5
+        ) -> None    : 
+            super().__init__()
+            self.dice = BinaryDiceLoss()  # Keep your existing one (it works on probs)
+            self.bce = nn.BCEWithLogitsLoss()  # Expects raw logits!
+            self.tsl = TemporalSmoothLoss()
+            self.ac = AreaConsistencyLoss()
+            total_weight = dice_weight + bce_weight + tsl_weight + ac_weight #automatically normalize the weights to 1
+            self.dice_weight = dice_weight / total_weight
+            self.bce_weight = bce_weight / total_weight
+            self.tsl_weight = tsl_weight / total_weight
+            self.ac_weight = ac_weight / total_weight
 
-def compute_iou(pred_probs, target):
-    """Jaccard Index (IoU)"""
-    pred_binary = (pred_probs > 0.5).float()
-    target_binary = target.float()
-    
-    intersection = (pred_binary * target_binary).sum()
-    union = (pred_binary + target_binary).sum() - intersection
-    
-    return (intersection + 1e-7) / (union + 1e-7)
+        def forward(self, logits, target, label_idx):
+            # Access parent class static method
+            pred_label = SegmentationTrainer._slice_tensor_at_label(logits, label_idx)
+            mask_label = SegmentationTrainer._slice_tensor_at_label(target, label_idx)
+            probs_label = torch.sigmoid(pred_label)  # For Dice
+            probs = torch.sigmoid(logits)
+            dice_loss = self.dice(probs_label, mask_label)
+            bce_loss = self.bce(pred_label, mask_label.float())
+            temp_loss = self.tsl(probs)
+            ac_loss = self.ac(probs)
+            return self.dice_weight * dice_loss + self.bce_weight * bce_loss + self.tsl_weight * temp_loss + self.ac_weight * ac_loss
 
-
-def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
-    slices = []
-    for i in range(pred.shape[0]):
-        indices = label_idx[i]
-        if not torch.is_tensor(indices):
-            indices = torch.tensor(indices, device=pred.device, dtype=torch.long)
-        # pred[i:i+1] keeps batch dim for cat compatibility
-        slices.append(pred[i:i+1, :, indices, :, :])   # (1, C, N_i, H, W)
-
-    return torch.cat(slices, dim=0)  # (N_total, C, H, W)
-
-def train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e3):
-    model.train()
-    total_loss = 0.0
-    batches_per_epoch = 0
-    
-    for batch_idx, batch in enumerate(tqdm(loader, desc='Train')):
-        batches_per_epoch += 1
-        if batches_per_epoch > max_batch_per_epoch:
-            break
-
-        frames = batch['frame'].to(DEVICE)
-        target = batch['mask'].to(DEVICE)
-        label_idx = batch['label_idx'].to(DEVICE)
-        optimizer.zero_grad()
-        try:
-            pred = model(frames)
-        except Exception as e:
-            print(f"[ERROR][train] model forward failed: {e}")
-            raise
-        #get the labeled slice only for simple evalutaion of the dice loss
-        #NOTE: might adjust this if we take the temporal loss into account
-
-        loss = loss_fn(pred, target, label_idx)
-        loss.backward()
-        optimizer.step()
+    @staticmethod
+    def compute_iou(pred_probs, target):
+        """Jaccard Index (IoU)"""
+        pred_binary = (pred_probs > 0.5).float()
+        target_binary = target.float()
         
-        total_loss += loss.item()
+        intersection = (pred_binary * target_binary).sum()
+        union = (pred_binary + target_binary).sum() - intersection
+        
+        return (intersection + 1e-7) / (union + 1e-7)
 
-    
-    return total_loss / len(loader)
+    @staticmethod
+    def _slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
+        slices = []
+        for i in range(pred.shape[0]):
+            indices = label_idx[i]
+            if not torch.is_tensor(indices):
+                indices = torch.tensor(indices, device=pred.device, dtype=torch.long)
+            # pred[i:i+1] keeps batch dim for cat compatibility
+            slices.append(pred[i:i+1, :, indices, :, :])   # (1, C, N_i, H, W)
 
-def train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs: int,
+        return torch.cat(slices, dim=0)  # (N_total, C, H, W)
+
+    def __init__(self, model, train_loader, val_loader, optimizer, n_epochs: int,
+                loss_fn: nn.Module = CombinedLoss(),
                 create_video: bool=True,
                 max_batch_per_epoch: int = 1e3,
                 max_batch_per_val:int = 1e3,
+                patience: int = 50,
                 ):
-    best_iou = 0.0
-    patience = 0
-    for epoch in range(n_epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, max_batch_per_epoch)
-        print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
-        val_loss, val_iou, video_payload = validate(model, val_loader, loss_fn, create_video, max_batch_per_val)
-        print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU={val_iou:.4f}")
-        if val_iou > best_iou:
-            best_iou = val_iou
-            patience = 0
-            torch.save(model.state_dict(), 'best_model.pt')
-            if create_video and video_payload is not None:
-                try:
-                    vgen = VideoGenerator(
-                        video_payload["batch"],
-                        video_payload["pred_masks"],
-                        video_payload["true_masks"],
-                        batch_idx=video_payload["batch_idx"],
-                        output_dir="videos",
-                    )
-                    vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
-                except Exception as e:
-                    print(f"[ERROR][train] video generation failed:\n {e}")
-        else:
-            patience += 1
-            if patience >= 50: #TODO: make this a hyperparameter
-                print("Early stopping")
-                break
-    return model
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+        self.n_epochs = n_epochs
+        self.create_video = create_video
+        self.max_batch_per_epoch = max_batch_per_epoch
+        self.max_batch_per_val = max_batch_per_val
+        self.patience = patience
+        
 
-
-def validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:int = 1e3):
-    model.eval()
-    total_loss = 0.0
-    total_iou = 0.0
-    batches_per_val = 0
-    video_payload = None
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(loader, desc='Val')):
-            batches_per_val += 1
-            if batches_per_val > max_batch_per_val:
+    @staticmethod
+    def _train_epoch(model, loader, optimizer, loss_fn, max_batch_per_epoch: int = 1e3):
+        model.train()
+        total_loss = 0.0
+        batches_per_epoch = 0
+        
+        for batch_idx, batch in enumerate(tqdm(loader, desc='Train')):
+            batches_per_epoch += 1
+            if batches_per_epoch > max_batch_per_epoch:
                 break
+
             frames = batch['frame'].to(DEVICE)
             target = batch['mask'].to(DEVICE)
             label_idx = batch['label_idx'].to(DEVICE)
-            pred = model(frames)  # (B, C, T, H, W)
-
+            optimizer.zero_grad()
+            try:
+                pred = model(frames)
+            except Exception as e:
+                print(f"[ERROR][train] model forward failed: {e}")
+                raise
+            #get the labeled slice only for simple evalutaion of the dice loss
+            #NOTE: might adjust this if we take the temporal loss into account
 
             loss = loss_fn(pred, target, label_idx)
+            loss.backward()
+            optimizer.step()
+            
             total_loss += loss.item()
 
-            pred_probs = torch.sigmoid(slice_tensor_at_label(pred, label_idx))
-            
-            iou = compute_iou(pred_probs, slice_tensor_at_label(target, label_idx))
-            total_iou += iou.item()
-            if create_video and video_payload is None:
-                # Capture first available batch for potential video generation
-                video_payload = {
-                    "batch": batch,
-                    "pred_masks": pred.cpu().numpy(),
-                    "true_masks": target.cpu().numpy(),
-                    "batch_idx": batch_idx,
-                }
+        
+        return total_loss / len(loader)
 
-    return total_loss / len(loader), total_iou / len(loader), video_payload
+    def train_model(self):
+        best_iou = 0.0
+        patience = 0
+        last_saved_path = Path()
+        for epoch in range(self.n_epochs):
+            train_loss = self._train_epoch(self.model, self.train_loader, self.optimizer, self.loss_fn, self.max_batch_per_epoch)
+            print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
+            val_loss, val_iou, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.create_video, self.max_batch_per_val)
+            print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU={val_iou:.4f}")
+            if val_iou > best_iou:
+                best_iou = val_iou
+                patience = 0
+                if val_iou > 0.4:  #save only if iou is above 0.4 (baseline)
+                    save_path = Path('pretrained_models') / f'ep{int(epoch+1):03d}_dim{TARGET_SHAPE[0]}x{TARGET_SHAPE[1]}_iou{str(val_iou).replace(".", "")[:4]}.pt'
+                    torch.save(self.model.state_dict(), save_path)
+                    print(f"Saved model to {save_path}")
+                    last_saved_path.unlink(missing_ok=True)
+                    last_saved_path = save_path
+                if self.create_video and video_payload is not None:
+                    try:
+                        vgen = VideoGenerator(
+                            video_payload["batch"],
+                            video_payload["pred_masks"],
+                            video_payload["true_masks"],
+                            batch_idx=video_payload["batch_idx"],
+                            output_dir=Path('videos')
+                        )
+                        vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
+                    except Exception as e:
+                        print(f"[ERROR][train] video generation failed:\n {e}")
+            else:
+                patience += 1
+                if patience >= self.patience:
+                    print("Early stopping")
+                    break
+        return self
+
+    @staticmethod
+    def _validate(model, loader, loss_fn, create_video: bool=True, max_batch_per_val:int = 1e3):
+        model.eval()
+        total_loss = 0.0
+        total_iou = 0.0
+        batches_per_val = 0
+        video_payload = None
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(loader, desc='Val')):
+                batches_per_val += 1
+                if batches_per_val > max_batch_per_val:
+                    break
+                frames = batch['frame'].to(DEVICE)
+                target = batch['mask'].to(DEVICE)
+                label_idx = batch['label_idx'].to(DEVICE)
+                pred = model(frames)  # (B, C, T, H, W)
 
 
-def predict_test(model, loader, test_data):
-    raise NotImplementedError("Predict test is not implemented by human")
-    """Generate predictions for test set - extract center frame from 3D output"""
-    model.eval()
-    predictions = {}
-    
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(loader, desc='Predict')):
-            frames = batch['frame']
-            names = batch['name']
-            frame_indices = batch['frame_idx'].cpu().numpy()
-            try:
-                pred = model(frames)  # Shape: (B, C, T, H, W)
-            except Exception as e:
-                print(f"[ERROR][predict] model forward failed: {e}")
-                raise
-            pred_label = slice_tensor_at_label(pred, label_idx)
-            
-            for i, name in enumerate(names):
-                if name not in predictions:
-                    predictions[name] = {}
+                loss = loss_fn(pred, target, label_idx)
+                total_loss += loss.item()
+
+                pred_probs = torch.sigmoid(SegmentationTrainer._slice_tensor_at_label(pred, label_idx))
                 
-                predictions[name][int(frame_indices[i])] = pred_label[i]
-    
-    # Reconstruct full video masks at ORIGINAL resolution
-    results = {}
-    for item in test_data:
-        name = item['name']
-        orig_shape = item['video'].shape  # Original video shape (H, W, T)
-        
-        full_mask = np.zeros(orig_shape, dtype=bool)
-        for frame_idx, mask_112 in predictions[name].items():
-            # Resize from 112x112 back to original size
-            mask_orig = resize_frame(mask_112, (orig_shape[0], orig_shape[1]))
-            full_mask[:, :, frame_idx] = mask_orig > 0.5
-        
-        results[name] = full_mask
-    
-    return results
+                iou = SegmentationTrainer.compute_iou(pred_probs, SegmentationTrainer._slice_tensor_at_label(target, label_idx))
+                total_iou += iou.item()
+                if create_video and video_payload is None:
+                    # Capture first available batch for potential video generation
+                    video_payload = {
+                        "batch": batch,
+                        "pred_masks": pred.cpu().numpy(),
+                        "true_masks": target.cpu().numpy(),
+                        "batch_idx": batch_idx,
+                    }
+
+        return total_loss / len(loader), total_iou / len(loader), video_payload
 
 
-def save_submission(predictions, test_data, output_file='submission.csv'):
-    raise NotImplementedError("Save submission is not implemented by human")
-    """Save predictions as CSV submission"""
-    rows = []
-    
-    for i, item in enumerate(test_data):
-        name = item['name']
-        mask = predictions[name]
+    def predict_test(model, loader, test_data):
+        raise NotImplementedError("Predict test is not implemented by human")
+        """Generate predictions for test set - extract center frame from 3D output"""
+        model.eval()
+        predictions = {}
         
-        flattened = mask.flatten()
-        indices = np.where(flattened)[0]
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(loader, desc='Predict')):
+                frames = batch['frame']
+                names = batch['name']
+                frame_indices = batch['frame_idx'].cpu().numpy()
+                try:
+                    pred = model(frames)  # Shape: (B, C, T, H, W)
+                except Exception as e:
+                    print(f"[ERROR][predict] model forward failed: {e}")
+                    raise
+                pred_label = slice_tensor_at_label(pred, label_idx)
+                
+                for i, name in enumerate(names):
+                    if name not in predictions:
+                        predictions[name] = {}
+                    
+                    predictions[name][int(frame_indices[i])] = pred_label[i]
         
-        rle_parts = []
-        if len(indices) > 0:
-            start = indices[0]
-            length = 1
-            for j in range(1, len(indices)):
-                if indices[j] == indices[j-1] + 1:
-                    length += 1
-                else:
-                    rle_parts.append([int(start), int(length)])
-                    start = indices[j]
-                    length = 1
-            rle_parts.append([int(start), int(length)])
+        # Reconstruct full video masks at ORIGINAL resolution
+        results = {}
+        for item in test_data:
+            name = item['name']
+            orig_shape = item['video'].shape  # Original video shape (H, W, T)
+            
+            full_mask = np.zeros(orig_shape, dtype=bool)
+            for frame_idx, mask_112 in predictions[name].items():
+                # Resize from 112x112 back to original size
+                mask_orig = resize_frame(mask_112, (orig_shape[0], orig_shape[1]))
+                full_mask[:, :, frame_idx] = mask_orig > 0.5
+            
+            results[name] = full_mask
         
-        rows.append({'id': f"{name}_{i}", 'value': str(rle_parts)})
-    
-    pd.DataFrame(rows).to_csv(output_file, index=False)
-    print(f"Submission saved to {output_file}")
+        return results
+
+
+    def save_submission(predictions, test_data, output_file='submission.csv'):
+        raise NotImplementedError("Save submission is not implemented by human")
+        """Save predictions as CSV submission"""
+        rows = []
+        
+        for i, item in enumerate(test_data):
+            name = item['name']
+            mask = predictions[name]
+            
+            flattened = mask.flatten()
+            indices = np.where(flattened)[0]
+            
+            rle_parts = []
+            if len(indices) > 0:
+                start = indices[0]
+                length = 1
+                for j in range(1, len(indices)):
+                    if indices[j] == indices[j-1] + 1:
+                        length += 1
+                    else:
+                        rle_parts.append([int(start), int(length)])
+                        start = indices[j]
+                        length = 1
+                rle_parts.append([int(start), int(length)])
+            
+            rows.append({'id': f"{name}_{i}", 'value': str(rle_parts)})
+        
+        pd.DataFrame(rows).to_csv(output_file, index=False)
+        print(f"Submission saved to {output_file}")
 
 
 def main():
     EVAL = False
-    DEBUG = FALSE
+    DEBUG = True
     GB_RAM_PER_BATCH = 16
     create_video = True
 
@@ -426,12 +460,6 @@ def main():
     n_epochs: int = 100
     model_id: str = 'S'
 
-    #machine dependant hyperparameters
-    batch_size: int = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[0]
-    sequence_length: int = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[2]  #default to 16 if not specified
-    #(should roughly conserve aspect ratio of original pictures, see data_structures.json) use utils.dimension_scaler to generate sizes if needed
-    TARGET_SHAPE: tuple[int, int] = MACHINE_INFO.get("MAX_INPUT_SIZE", (1,1,16,224,304))[3:5]
-
     print(f"Using target shape: {TARGET_SHAPE}, sequence length {sequence_length}, batch size {batch_size}")
     
     # Load data
@@ -446,7 +474,10 @@ def main():
     num_val = int(0.2 * len(train_data))
     # Create generator with correct device to avoid device mismatch error
     train_split, val_split = random_split(train_data, [len(train_data) - num_val, num_val])
-    train_ds = MitralValveDataset(train_split, target_size=TARGET_SHAPE)
+    train_ds = MitralValveDataset(train_split, target_size=TARGET_SHAPE,
+    rotation_chance=0.5,
+    rotation_angle=20,
+    )
     val_ds = MitralValveDataset(val_split, target_size=TARGET_SHAPE)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
@@ -460,10 +491,20 @@ def main():
     
     # Quick test instantiation (run this to verify)
     model = SegmentationNet(n_frames=sequence_length, model_id=model_id).to(DEVICE)
-
-    loss_fn = CombinedLoss().to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    model = train_model(model, train_loader, val_loader, optimizer, loss_fn, n_epochs, create_video, max_batch_per_epoch, max_batch_per_val)
+    
+    # Use the new SegmentationTrainer class
+    trainer = SegmentationTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        n_epochs=n_epochs,
+        create_video=create_video,
+        max_batch_per_epoch=max_batch_per_epoch,
+        max_batch_per_val=max_batch_per_val
+    )
+    trainer.train_model()
     return None
 
 
