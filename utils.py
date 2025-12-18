@@ -94,6 +94,17 @@ def dimension_scaler(multiple:int, aspect_ratio_target: float=1.37, base_size: i
 # Short alias
 d = debug
 
+def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
+    slices = []
+    for i in range(pred.shape[0]):
+        indices = label_idx[i]
+        if not torch.is_tensor(indices):
+            indices = torch.tensor(indices, device=pred.device, dtype=torch.long)
+        # pred[i:i+1] keeps batch dim for cat compatibility
+        slices.append(pred[i:i+1, :, indices, :, :])   # (1, C, N_i, H, W)
+
+    return torch.cat(slices, dim=0)  # (N_total, C, H, W)
+
 if __name__ == "__main__":
     x, y = dimension_scaler(15)
     print(x, y, "n_voxels", f"{x * y:.3e}")

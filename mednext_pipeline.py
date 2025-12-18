@@ -9,22 +9,16 @@ Lean implementation focusing on core ML pipeline:
 - Inference & submission
 """
 import os
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-import pandas as pd
-from tqdm import tqdm
 from pathlib import Path
-from datetime import datetime
-import time
 
 from mednext import create_mednext_v1
-from utils import debug
-from data_prep import load_zipped_pickle, resize_frame, MitralValveDataset, DatasetType
-from video_generator import VideoGenerator
-
+from data_prep import load_zipped_pickle, MitralValveDataset
+from trainer import SegmentationTrainer
+from predictor import SegmentationPredictor
 
 
 MACHINE_CONFIGS = {
@@ -134,397 +128,6 @@ class SegmentationNet(nn.Module):
 
         return output
 
-# ============================================================================
-# LOSS FUNCTIONS
-# ============================================================================
-
-class BinaryDiceLoss(nn.Module):
-    def __init__(self, smooth=1.0):
-        super().__init__()
-        self.smooth = smooth
-    
-    def forward(self, pred_probs, target):
-        # Flatten all spatial + temporal dimensions (keep batch and channel)
-        pred_flat = pred_probs.view(pred_probs.size(0), pred_probs.size(1), -1)   # → (B, 1, T*H*W)
-        target_flat = target.view(target.size(0), target.size(1), -1)  # → (B, 1, T*H*W)
-        
-        # Compute intersection and union per batch and channel
-        intersection = (pred_flat * target_flat).sum(dim=2)  # (B, 1)
-        union = pred_flat.sum(dim=2) + target_flat.sum(dim=2)  # (B, 1)
-
-        dice = (2 * intersection + self.smooth) / (union + self.smooth)
-        
-        # Average over batch and channel dimensions to get single scalar loss
-        return 1 - dice.mean()
-
-class TemporalSmoothLoss(nn.Module):
-    """Encourages smooth predictions across consecutive frames using L1 on probabilities"""
-    def __init__(self, reduction='mean'):
-        super().__init__()
-        self.reduction = reduction
-    
-    def forward(self, pred):
-        """
-        pred: (B, C, T, H, W) – probabilities (after sigmoid) or logits
-              We recommend applying this on probabilities [0,1] for interpretability.
-        """
-        # Shift pred by one frame along temporal dimension
-        pred_t = pred[:, :, :-1, :, :]   # frames 0 to T-2
-        pred_t_plus_1 = pred[:, :, 1:, :, :]  # frames 1 to T-1
-        
-        # Absolute difference between consecutive frames
-        diff = torch.abs(pred_t_plus_1 - pred_t)  # (B, C, T-1, H, W)
-        
-        # Sum/mean over spatial dims, then over temporal pairs and batch
-        if self.reduction == 'mean':
-            return diff.mean()
-        elif self.reduction == 'sum':
-            return diff.sum()
-        else:
-            raise ValueError("reduction must be 'mean' or 'sum'")
-
-class AreaConsistencyLoss(nn.Module):
-    def __init__(self, weight=0.01):
-        super().__init__()
-        self.weight = weight
-
-    def forward(self, probs):  # probs = sigmoid(logits), shape (B, 1, T, H, W)
-        # Sum foreground probability mass per frame in batch
-        areas = probs.sum(dim=[2,3,4])  # → (B,)
-        # Penalize large changes between consecutive frames in batch (approximation)
-        if areas.shape[0] > 1:
-            diff = torch.abs(areas[1:] - areas[:-1])
-            return self.weight * diff.mean()
-        return 0.0 * areas.sum()  # 0 if batch=1
-
-
-class SegmentationTrainer:
-
-    allow_no_user_input: bool = False
-
-    class CombinedLoss(nn.Module):
-        def __init__(self,
-        dice_weight: float=50,
-        bce_weight : float=50,
-        tsl_weight : float=1,
-        ac_weight  : float=0.5
-        ) -> None    : 
-            super().__init__()
-            self.dice = BinaryDiceLoss()  # Keep your existing one (it works on probs)
-            self.bce = nn.BCEWithLogitsLoss()  # Expects raw logits!
-            self.tsl = TemporalSmoothLoss()
-            self.ac = AreaConsistencyLoss()
-            total_weight = dice_weight + bce_weight + tsl_weight + ac_weight #automatically normalize the weights to 1
-            self.dice_weight = dice_weight / total_weight
-            self.bce_weight = bce_weight / total_weight
-            self.tsl_weight = tsl_weight / total_weight
-            self.ac_weight = ac_weight / total_weight
-
-        def forward(self, logits, target, label_idx):
-            # Access parent class static method
-            pred_label = SegmentationTrainer._slice_tensor_at_label(logits, label_idx)
-            mask_label = SegmentationTrainer._slice_tensor_at_label(target, label_idx)
-            probs_label = torch.sigmoid(pred_label)  # For Dice
-            probs = torch.sigmoid(logits)
-            dice_loss = self.dice(probs_label, mask_label)
-            bce_loss = self.bce(pred_label, mask_label.float())
-            temp_loss = self.tsl(probs)
-            ac_loss = self.ac(probs)
-            return self.dice_weight * dice_loss + self.bce_weight * bce_loss + self.tsl_weight * temp_loss + self.ac_weight * ac_loss
-
-    @staticmethod
-    def compute_iou(pred_probs, target):
-        """Jaccard Index (IoU)"""
-        pred_binary = (pred_probs > 0.5).float()
-        target_binary = target.float()
-        
-        intersection = (pred_binary * target_binary).sum()
-        union = (pred_binary + target_binary).sum() - intersection
-        
-        return (intersection + 1e-7) / (union + 1e-7)
-
-    @staticmethod
-    def _slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
-        slices = []
-        for i in range(pred.shape[0]):
-            indices = label_idx[i]
-            if not torch.is_tensor(indices):
-                indices = torch.tensor(indices, device=pred.device, dtype=torch.long)
-            # pred[i:i+1] keeps batch dim for cat compatibility
-            slices.append(pred[i:i+1, :, indices, :, :])   # (1, C, N_i, H, W)
-
-        return torch.cat(slices, dim=0)  # (N_total, C, H, W)
-
-    def __init__(self, model, train_loader, val_loader, optimizer, n_epochs: int,
-                loss_fn: nn.Module = CombinedLoss(),
-                create_video: bool=True,
-                max_batch_per_epoch: int = 1e3,
-                max_batch_per_val:int = 1e3,
-                patience: int = 50,
-                save_threshold_iou: float = 0.4,
-                training_dir: Path = None,
-                target_shape: tuple = None,
-                device: str = "cpu",
-                ):
-        self.model = model
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.optimizer = optimizer
-        self.loss_fn = loss_fn
-        self.n_epochs = n_epochs
-        self.create_video = create_video
-        self.max_batch_per_epoch = max_batch_per_epoch
-        self.max_batch_per_val = max_batch_per_val
-        self.patience = patience
-        self.save_threshold_iou = save_threshold_iou
-        self.device = device
-        # Initialize training summary DataFrame
-        self.training_summary = []
-        
-        # Set up training directory
-        if training_dir is None:
-            if target_shape is None:
-                raise ValueError("target_shape must be provided if training_dir is None")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.training_dir = Path('training') / f"{timestamp}_dim{target_shape[0]}x{target_shape[1]}"
-        else:
-            self.training_dir = Path(training_dir)
-        
-        # Create training directory structure
-        self.training_dir.mkdir(parents=True, exist_ok=True)
-        (self.training_dir / 'models').mkdir(exist_ok=True)
-        (self.training_dir / 'videos').mkdir(exist_ok=True)
-        
-        if not self.allow_no_user_input:
-            self._get_user_training_description()
-        else:
-            print("Allowing no user input, continuing without user input")
-        
-    def _get_user_training_description(self):
-        description = input("Enter a description for the training: ")
-        with open(self.training_dir / 'description.txt', 'w') as f:
-            f.write(description)
-        print(f"Training description saved to {self.training_dir / 'description.txt'}")
-        return description
-
-    @staticmethod
-    def _train_epoch(model, loader, optimizer, loss_fn, device, max_batch_per_epoch: int = 1e3):
-        model.train()
-        total_loss = 0.0
-        batches_per_epoch = 0
-        
-        for batch_idx, batch in enumerate(loader):
-            batches_per_epoch += 1
-            if batches_per_epoch > max_batch_per_epoch:
-                break
-
-            frames = batch['frame'].to(device)
-            target = batch['mask'].to(device)
-            label_idx = batch['label_idx'].to(device)
-            optimizer.zero_grad()
-            try:
-                pred = model(frames)
-            except Exception as e:
-                print(f"[ERROR][train] model forward failed: {e}")
-                raise
-
-            loss = loss_fn(pred, target, label_idx)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-
-        
-        return total_loss / len(loader)
-
-    def train_model(self):
-        best_iou = 0.0
-        patience = 0
-        best_model_path = None
-        
-        for epoch in range(self.n_epochs):
-            train_loss = self._train_epoch(self.model, self.train_loader, self.optimizer, self.loss_fn, self.device, self.max_batch_per_epoch)
-            print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
-            val_loss, val_iou, val_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.device, self.create_video, self.max_batch_per_val)
-            print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU={val_iou:.4f}, Val IoU (orig size)={val_iou_orig:.4f}")
-            
-            # Record training summary
-            self.training_summary.append({
-                'epoch': epoch + 1,
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'val_iou': val_iou
-            })
-            
-            if val_iou > best_iou:
-                best_iou = val_iou
-                patience = 0
-                
-                # Delete previous best model if exists
-                if best_model_path is not None and best_model_path.exists():
-                    best_model_path.unlink(missing_ok=True)
-                
-                if val_iou > self.save_threshold_iou:
-                    # Save new best model to training_dir/models
-                    iou_string = f'iou{val_iou:.4f}'.replace('.', '')
-                    model_filename = f'ep{epoch+1:03d}_iou{iou_string}.pt'
-                    best_model_path = self.training_dir / 'models' / model_filename
-                    torch.save(self.model.state_dict(), best_model_path)
-                    print(f"Saved best model to {best_model_path}")
-                
-                # Save video if enabled
-                if self.create_video and video_payload is not None:
-                    try:
-                        vgen = VideoGenerator(
-                            video_payload["batch"],
-                            video_payload["pred_masks"],
-                            video_payload["true_masks"],
-                            batch_idx=video_payload["batch_idx"],
-                            output_dir=self.training_dir / 'videos'
-                        )
-                        video_path = vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
-                        print(f"Saved video to {video_path}")
-                    except Exception as e:
-                        print(f"[ERROR][train] video generation failed:\n {e}")
-            else:
-                patience += 1
-                if patience >= self.patience:
-                    print("Early stopping")
-                    break
-        
-        # Save training summary CSV at the end
-        self._save_training_summary()
-        
-        return self
-    
-    def _save_training_summary(self):
-        """Save training summary to CSV file"""
-        if len(self.training_summary) > 0:
-            df = pd.DataFrame(self.training_summary)
-            summary_path = self.training_dir / 'training_summary.csv'
-            df.to_csv(summary_path, index=False)
-            print(f"Saved training summary to {summary_path}")
-        else:
-            print("Warning: No training summary to save")
-
-    @staticmethod
-    def _validate(model, loader, loss_fn, device, create_video: bool=True, max_batch_per_val:int = 1e3):
-        model.eval()
-        total_loss = 0.0
-        total_iou = 0.0
-        total_iou_orig_size = 0.0
-        batches_per_val = 0
-        video_payload = None
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(loader):
-                batches_per_val += 1
-                if batches_per_val > max_batch_per_val:
-                    break
-                frames = batch['frame'].to(device)
-                target = batch['mask'].to(device)
-                label_idx = batch['label_idx']
-                pred = model(frames)  # (B, C, T, H, W)
-                orig_shape = batch['orig_shape']
-                orig_mask = batch['orig_mask'].to(device)
-
-                loss = loss_fn(pred, target, label_idx)
-                total_loss += loss.item()
-
-                pred_probs = torch.sigmoid(SegmentationTrainer._slice_tensor_at_label(pred, label_idx))
-                target = SegmentationTrainer._slice_tensor_at_label(target, label_idx)
-
-                target_orig = SegmentationTrainer._slice_tensor_at_label(orig_mask, label_idx)
-                prob_upsampled = torch.nn.functional.interpolate(pred_probs,  
-                                                size=orig_shape, 
-                                                mode='nearest')
-                
-                iou = SegmentationTrainer.compute_iou(pred_probs, target)
-                iou_orig_size = SegmentationTrainer.compute_iou(prob_upsampled, target_orig)
-                total_iou += iou.item()
-                total_iou_orig_size += iou_orig_size.item()
-                if create_video and video_payload is None:
-                    # Capture first available batch for potential video generation
-                    video_payload = {
-                        "batch": batch,
-                        "pred_masks": pred.cpu().numpy(),
-                        "true_masks": target.cpu().numpy(),
-                        "batch_idx": batch_idx,
-                    }
-
-        return total_loss / len(loader), total_iou / len(loader), total_iou_orig_size / len(loader), video_payload
-
-
-    def predict_test(model, loader, test_data):
-        raise NotImplementedError("Predict test is not implemented by human")
-        """Generate predictions for test set - extract center frame from 3D output"""
-        model.eval()
-        predictions = {}
-        
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(loader):
-                frames = batch['frame']
-                names = batch['name']
-                frame_indices = batch['frame_idx'].cpu().numpy()
-                try:
-                    pred = model(frames)  # Shape: (B, C, T, H, W)
-                except Exception as e:
-                    print(f"[ERROR][predict] model forward failed: {e}")
-                    raise
-                pred_label = slice_tensor_at_label(pred, label_idx)
-                
-                for i, name in enumerate(names):
-                    if name not in predictions:
-                        predictions[name] = {}
-                    
-                    predictions[name][int(frame_indices[i])] = pred_label[i]
-        
-        # Reconstruct full video masks at ORIGINAL resolution
-        results = {}
-        for item in test_data:
-            name = item['name']
-            orig_shape = item['video'].shape  # Original video shape (H, W, T)
-            
-            full_mask = np.zeros(orig_shape, dtype=bool)
-            for frame_idx, mask_112 in predictions[name].items():
-                # Resize from 112x112 back to original size
-                mask_orig = resize_frame(mask_112, (orig_shape[0], orig_shape[1]))
-                full_mask[:, :, frame_idx] = mask_orig > 0.5
-            
-            results[name] = full_mask
-        
-        return results
-
-
-    def save_submission(predictions, test_data, output_file='submission.csv'):
-        raise NotImplementedError("Save submission is not implemented by human")
-        """Save predictions as CSV submission"""
-        rows = []
-        
-        for i, item in enumerate(test_data):
-            name = item['name']
-            mask = predictions[name]
-            
-            flattened = mask.flatten()
-            indices = np.where(flattened)[0]
-            
-            rle_parts = []
-            if len(indices) > 0:
-                start = indices[0]
-                length = 1
-                for j in range(1, len(indices)):
-                    if indices[j] == indices[j-1] + 1:
-                        length += 1
-                    else:
-                        rle_parts.append([int(start), int(length)])
-                        start = indices[j]
-                        length = 1
-                rle_parts.append([int(start), int(length)])
-            
-            rows.append({'id': f"{name}_{i}", 'value': str(rle_parts)})
-        
-        pd.DataFrame(rows).to_csv(output_file, index=False)
-        print(f"Submission saved to {output_file}")
 
 
 def main_train():
@@ -563,12 +166,12 @@ def main_train():
     num_val = int(0.2 * len(train_data))
     # Create generator with correct device to avoid device mismatch error
     train_split, val_split = random_split(train_data, [len(train_data) - num_val, num_val])
-    train_ds = MitralValveDataset(train_split, target_size=TARGET_SHAPE,
+    train_ds = MitralValveDataset(train_split, mode="train", target_size=TARGET_SHAPE,
     random_label_position=random_label_position,
     rotation_chance=rotation_chance,
     rotation_angle=20,
     )
-    val_ds = MitralValveDataset(val_split, target_size=TARGET_SHAPE, test_data=True)
+    val_ds = MitralValveDataset(val_split, mode="val", target_size=TARGET_SHAPE)
     print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
 
     train_loader = DataLoader(train_ds,
@@ -582,11 +185,6 @@ def main_train():
     num_workers=NUM_WORKERS,
     persistent_workers=True,
     )
-    
-    if EVAL:
-        test_ds = MitralValveDataset(test_data, target_size=TARGET_SHAPE, test_data=True)
-        test_loader = DataLoader(test_ds, batch_size=batch_size, num_workers=NUM_WORKERS)
-        print(f"Test: {len(test_ds)}")
     
     # Quick test instantiation (run this to verify)
     model = SegmentationNet(n_frames=sequence_length, model_id=model_id).to(DEVICE)
@@ -608,7 +206,75 @@ def main_train():
     trainer.train_model()
     return None
 
-
+def main_predict(model_path: Path, expected_iou: float = 0.5):
+    """
+    Generate predictions for test set and save submission file.
+    
+    Args:
+        model_path: Path to the trained model checkpoint
+        expected_iou: Expected IoU for directory naming (e.g., 0.5430)
+    """
+    # Setup machine configuration
+    DEVICE, batch_size, sequence_length, TARGET_SHAPE, NUM_WORKERS = setup_machine_config(workspace="home_station")
+    
+    # Load model
+    model = SegmentationNet(n_frames=sequence_length, model_id='S').to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+    print(f"Loaded model from {model_path}")
+    
+    # Load test data
+    test_data = load_zipped_pickle('test.pkl')
+    #test_data = test_data[:1] #for debug
+    print(f"Loaded {len(test_data)} test videos")
+    
+    # Create test dataset and loader
+    # Note: For test data, we need to predict ALL frames, not just labeled ones
+    test_ds = MitralValveDataset(test_data, mode="test", seq_len=sequence_length, target_size=TARGET_SHAPE)
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        num_workers=5,
+        persistent_workers=True if NUM_WORKERS > 0 else False,
+        shuffle=False
+    )
+    print(f"Test dataset: {len(test_ds)} sequences")
+    
+    # Generate predictions
+    print("Generating predictions...")
+    predictions = SegmentationPredictor.predict_test(
+        model=model,
+        loader=test_loader,
+        device=DEVICE,
+        seq_len=sequence_length,
+        num_postprocess_workers=2,
+        test_data=test_data  # Pass test_data to verify original shapes
+    )
+    
+    # Save submission file
+    print("Saving submission file...")
+    output_file, output_dir = SegmentationPredictor.save_submission(
+        predictions=predictions,
+        test_data=test_data,
+        expected_iou=expected_iou
+    )
+    generate_videos = False
+    if generate_videos:
+        # Generate visualization videos
+        print("Generating visualization videos...")
+        SegmentationPredictor.generate_full_videos(
+            predictions=predictions,
+            test_data=test_data,
+            output_dir=output_dir,
+            max_videos=20
+        )
+        
+    print(f"Prediction complete! Submission saved to {output_file}")
+    print(f"Videos saved to {output_dir / 'videos'}")
+    return predictions, output_file
 
 if __name__ == '__main__':
-    main_train()
+    main_predict(
+        model_path=Path('D:/ETH/Master/AML/AML2/training/20251218_015707_dim160x224/models/ep010_iou05430.pt'),
+        expected_iou=0.5430
+    )
