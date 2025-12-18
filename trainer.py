@@ -299,6 +299,7 @@ class SegmentationTrainer:
                     'train_loss': train_loss,
                     'train_iou': train_iou,
                 })
+                val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = 0, 0, 0, 0, 0, None
             
             if val_iou > best_val_iou or train_iou > best_train_iou:
                 if self.no_validation:
