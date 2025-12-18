@@ -94,16 +94,29 @@ def dimension_scaler(multiple:int, aspect_ratio_target: float=1.37, base_size: i
 # Short alias
 d = debug
 
-def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Tensor:
+def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int], stride_factor=1) -> torch.Tensor:
     slices = []
     for i in range(pred.shape[0]):
         indices = label_idx[i]
         if not torch.is_tensor(indices):
             indices = torch.tensor(indices, device=pred.device, dtype=torch.long)
-        # pred[i:i+1] keeps batch dim for cat compatibility
-        slices.append(pred[i:i+1, :, indices, :, :])   # (1, C, N_i, H, W)
+        
+        # Scale indices by stride (downsample time position)
+        scaled_indices = indices // stride_factor
+        
+        # Clamp to valid T range (pred.shape[2])
+        scaled_indices = scaled_indices.clamp(0, pred.shape[2] - 1)
+        
+        # Remove duplicates if merging occurred (optional, but helps if T small)
+        scaled_indices = torch.unique(scaled_indices)
+        
+        if scaled_indices.numel() == 0:
+            # Rare: no valid labels at this level → skip or use dummy (e.g., mean frame)
+            continue  # or handle gracefully
+        
+        slices.append(pred[i:i+1, :, scaled_indices, :, :])
 
-    return torch.cat(slices, dim=0)  # (N_total, C, H, W)
+    return torch.cat(slices, dim=0) if slices else torch.empty(0)  # Handle empty case
 
 def write_configuration_string(HYPERPARAMETERS):
     configuration_string = ""

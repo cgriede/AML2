@@ -41,6 +41,10 @@ class TemporalSmoothLoss(nn.Module):
         pred: (B, C, T, H, W) – probabilities (after sigmoid) or logits
               We recommend applying this on probabilities [0,1] for interpretability.
         """
+
+        #if there is only one frame, return 0
+        if pred.shape[2] < 2:
+            return torch.tensor(0.0)
         # Shift pred by one frame along temporal dimension
         pred_t = pred[:, :, :-1, :, :]   # frames 0 to T-2
         pred_t_plus_1 = pred[:, :, 1:, :, :]  # frames 1 to T-1
@@ -62,6 +66,9 @@ class AreaConsistencyLoss(nn.Module):
         self.weight = weight
 
     def forward(self, probs):  # probs = sigmoid(logits), shape (B, 1, T, H, W)
+        #if there is only one frame, return 0
+        if probs.shape[2] < 2:
+            return torch.tensor(0.0)
         # Sum foreground probability mass per frame in batch
         areas = probs.sum(dim=[2,3,4])  # → (B,)
         # Penalize large changes between consecutive frames in batch (approximation)
@@ -77,33 +84,89 @@ class SegmentationTrainer:
 
     class CombinedLoss(nn.Module):
         def __init__(self,
-        dice_weight: float=50,
-        bce_weight : float=50,
-        tsl_weight : float=1,
-        ac_weight  : float=0.5
-        ) -> None    : 
+                    dice_weight: float = 50,
+                    bce_weight: float = 50,
+                    tsl_weight: float = 1,
+                    ac_weight: float = 0.5) -> None:
             super().__init__()
-            self.dice = BinaryDiceLoss()  # Keep your existing one (it works on probs)
-            self.bce = nn.BCEWithLogitsLoss()  # Expects raw logits!
+            self.dice = BinaryDiceLoss()
+            self.bce = nn.BCEWithLogitsLoss()
             self.tsl = TemporalSmoothLoss()
             self.ac = AreaConsistencyLoss()
-            total_weight = dice_weight + bce_weight + tsl_weight + ac_weight #automatically normalize the weights to 1
-            self.dice_weight = dice_weight / total_weight
-            self.bce_weight = bce_weight / total_weight
-            self.tsl_weight = tsl_weight / total_weight
-            self.ac_weight = ac_weight / total_weight
 
-        def forward(self, logits, target, label_idx):
-            # Access parent class static method
-            pred_label = slice_tensor_at_label(logits, label_idx)
-            mask_label = slice_tensor_at_label(target, label_idx)
-            probs_label = torch.sigmoid(pred_label)  # For Dice
-            probs = torch.sigmoid(logits)
-            dice_loss = self.dice(probs_label, mask_label)
-            bce_loss = self.bce(pred_label, mask_label.float())
-            temp_loss = self.tsl(probs)
-            ac_loss = self.ac(probs)
-            return self.dice_weight * dice_loss + self.bce_weight * bce_loss + self.tsl_weight * temp_loss + self.ac_weight * ac_loss
+            total = dice_weight + bce_weight + tsl_weight + ac_weight
+            self.dice_weight = dice_weight / total
+            self.bce_weight = bce_weight / total
+            self.tsl_weight = tsl_weight / total
+            self.ac_weight = ac_weight / total
+
+        @staticmethod
+        def _get_downsampled_pred_target_pairs(target: torch.Tensor, preds: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+            pred_target_pairs = []
+            for i, pred in enumerate(preds):
+                # Downsample target to pred size (nearest to keep binary)
+                target_resized = torch.nn.functional.interpolate(
+                    target.float(), size=pred.shape[2:], mode='nearest'
+                ).long()  # or .bool() if binary
+                pred_target_pairs.append((pred, target_resized))
+            return pred_target_pairs
+
+        def forward(self, logits, target_original, label_idx):
+            """
+            logits: either single tensor or list of tensors (deep supervision)
+            target: full mask sequence (B, 1, T, H, W) or (B, T, H, W)
+            label_idx: list of lists — original labeled frame indices per video in batch
+            """
+            # Handle deep supervision: logits can be list
+            if isinstance(logits, list):
+                pred_target_pairs = self._get_downsampled_pred_target_pairs(target_original, logits)
+            else:
+                pred_target_pairs = [(logits, target_original)]
+
+            total_loss = 0.0
+            weights = [1.0, 0.5, 0.25, 0.125, 0.0625]  # fine to coarse
+
+            for (pred, target), w in zip(pred_target_pairs, weights):
+                # Compute temporal downsampling factor for this head
+                # pred.shape[2] = current T, target.shape[2] = original T
+                orig_T = target.shape[2]
+                current_T = pred.shape[2]
+                stride_t = orig_T // current_T  # e.g., 1, 2, 4, 8, 16
+
+                # Scale label indices to this resolution
+                # Scale label indices to this resolution
+                scaled_label_idx = []
+                for idx in label_idx:  # idx_tensor is always 1D tensor (shape (N,) or (1,))  # converts to Python list of ints, works for both [8] and [41,65,167]
+                    scaled = [idx // stride_t]
+                    scaled_label_idx.append(scaled)
+
+                # Only compute Dice/BCE on labeled frames at this scale
+                if any(len(s) > 0 for s in scaled_label_idx):  # if any video has labels
+                    pred_label = slice_tensor_at_label(pred, scaled_label_idx)
+                    mask_label = slice_tensor_at_label(target, scaled_label_idx)
+
+                    probs_label = torch.sigmoid(pred_label)
+                    dice_loss = self.dice(probs_label, mask_label)
+                    bce_loss = self.bce(pred_label, mask_label.float())
+                else:
+                    dice_loss = bce_loss = torch.tensor(0.0, device=pred.device)
+
+                # Temporal smoothness and area consistency on full-volume probs
+                probs = torch.sigmoid(pred)  # full spatio-temporal volume
+                temp_loss = self.tsl(probs)
+                ac_loss = self.ac(probs)
+
+                head_loss = (self.dice_weight * dice_loss +
+                            self.bce_weight * bce_loss +
+                            self.tsl_weight * temp_loss +
+                            self.ac_weight * ac_loss)
+
+                total_loss += w * head_loss
+
+                if torch.isnan(head_loss).item():
+                    raise ValueError(f"Head loss is NaN for head {w}")
+
+            return total_loss
 
     @staticmethod
     def compute_iou(pred_probs, target):
@@ -124,10 +187,13 @@ class SegmentationTrainer:
                 max_batch_per_val:int = 1e3,
                 patience: int = 50,
                 save_threshold_iou: float = 0.4,
+                save_threshold_loss: float = 0.17,
                 training_dir: Path = None,
                 target_shape: tuple = None,
                 device: str = "cpu",
+                deep_supervision: bool = False,
                 description: str = None,
+                no_validation: bool = False,
                 ):
         self.model = model
         self.train_loader = train_loader
@@ -140,8 +206,12 @@ class SegmentationTrainer:
         self.max_batch_per_val = max_batch_per_val
         self.patience = patience
         self.save_threshold_iou = save_threshold_iou
+        self.save_threshold_loss = save_threshold_loss
         self.device = device
+        self.deep_supervision = deep_supervision
         self.description = description
+        self.best_model_path = None
+        self.no_validation = no_validation
         # Initialize training summary DataFrame
         self.training_summary = []
         
@@ -174,8 +244,7 @@ class SegmentationTrainer:
         print(f"Training description saved to {self.training_dir / 'description.txt'}")
         return description
 
-    @staticmethod
-    def _train_epoch(model, loader, optimizer, loss_fn, device, max_batch_per_epoch: int = 1e3):
+    def _train_epoch(self,model, loader, optimizer, loss_fn, device, max_batch_per_epoch: int = 1e3):
         model.train()
         total_loss = 0.0
         batches_per_epoch = 0
@@ -184,60 +253,70 @@ class SegmentationTrainer:
             batches_per_epoch += 1
             if batches_per_epoch > max_batch_per_epoch:
                 break
-
             frames = batch['frame'].to(device)
             target = batch['mask'].to(device)
             label_idx = batch['label_idx'].to(device)
             optimizer.zero_grad()
-            try:
-                pred = model(frames)
-            except Exception as e:
-                print(f"[ERROR][train] model forward failed: {e}")
-                raise
-
-            loss = loss_fn(pred, target, label_idx)
+            logits = model(frames)
+            loss = loss_fn(logits, target, label_idx)
+            # Single backward on the full weighted loss
             loss.backward()
             optimizer.step()
-            
+            optimizer.zero_grad()
             total_loss += loss.item()
-
-        
         return total_loss / len(loader)
 
     def train_model(self):
         best_iou = 0.0
         patience = 0
-        best_model_path = None
+        best_loss = float('inf')
         
         for epoch in range(self.n_epochs):
             train_loss = self._train_epoch(self.model, self.train_loader, self.optimizer, self.loss_fn, self.device, self.max_batch_per_epoch)
             print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
-            val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.device, self.create_video, self.max_batch_per_val)
-            print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU (mean)={val_iou:.4f}, Val IoU (orig, mean)={val_iou_orig:.4f}, Val IoU (median, Kaggle-style)={median_iou:.4f}, Val IoU (orig, median)={median_iou_orig:.4f}")
-            
-            # Record training summary
-            self.training_summary.append({
-                'epoch': epoch + 1,
-                'train_loss': train_loss,
-                'val_loss': val_loss,
-                'val_iou': val_iou
-            })
+            if not self.no_validation:
+                val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.device, self.create_video, self.max_batch_per_val)
+                print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, \n\tVal IoU (mean)={val_iou:.4f}, \n\tVal IoU (orig, mean)={val_iou_orig:.4f}, \n\tVal IoU (median, Kaggle-style)={median_iou:.4f}, \n\tVal IoU (orig, median)={median_iou_orig:.4f}")
+                # Record training summary
+                self.training_summary.append({
+                    'epoch': epoch + 1,
+                    'train_loss': train_loss,
+                    'val_loss': val_loss,
+                    'val_iou': val_iou,
+                    'val_iou_orig': val_iou_orig,
+                    'median_iou': median_iou,
+                    'median_iou_orig': median_iou_orig
+                })
+            else:
+                val_loss = float('inf')
+                val_iou = 0.0
+                val_iou_orig = 0.0
+                median_iou = 0.0
+                median_iou_orig = 0.0
+                video_payload = None
+
+                self.training_summary.append({
+                    'epoch': epoch + 1,
+                    'train_loss': train_loss,
+                })
             
             if val_iou > best_iou:
                 best_iou = val_iou
                 patience = 0
-                
+                if train_loss < best_loss:
+                    best_loss = train_loss
+                    patience = 0
                 # Delete previous best model if exists
-                if best_model_path is not None and best_model_path.exists():
-                    best_model_path.unlink(missing_ok=True)
+                if self.best_model_path is not None and self.best_model_path.exists():
+                    self.best_model_path.unlink(missing_ok=True)
                 
-                if val_iou > self.save_threshold_iou:
+                if val_iou > self.save_threshold_iou or train_loss < self.save_threshold_loss:
                     # Save new best model to training_dir/models
                     iou_string = f'iou{val_iou:.4f}'.replace('.', '')
                     model_filename = f'ep{epoch+1:03d}_iou{iou_string}.pt'
-                    best_model_path = self.training_dir / 'models' / model_filename
-                    torch.save(self.model.state_dict(), best_model_path)
-                    print(f"Saved best model to {best_model_path}")
+                    self.best_model_path = self.training_dir / 'models' / model_filename
+                    torch.save(self.model.state_dict(), self.best_model_path)
+                    print(f"Saved best model to {self.best_model_path}")
                 
                 # Save video if enabled
                 if self.create_video and video_payload is not None:
@@ -274,8 +353,7 @@ class SegmentationTrainer:
         else:
             print("Warning: No training summary to save")
 
-    @staticmethod
-    def _validate(model, loader, loss_fn, device, create_video: bool=True, max_batch_per_val:int = 1e3):
+    def _validate(self, model, loader, loss_fn, device, create_video: bool=True, max_batch_per_val:int = 1e3):
         model.eval()
         total_loss = 0.0
         total_iou = 0.0
@@ -296,7 +374,9 @@ class SegmentationTrainer:
                 target = batch['mask'].to(device)
                 label_idx = batch['label_idx']
                 pred = model(frames)  # (B, C, T, H, W)
-                orig_shape = batch['orig_shape']
+                if self.deep_supervision: #only take the finest prediction for validation
+                    pred = pred[0]
+                orig_shape = batch['orig_shape'][0].item(), batch['orig_shape'][1].item()
                 orig_mask = batch['orig_mask'].to(device)
                 video_names = batch.get('video_name', [f'batch_{batch_idx}'] * frames.size(0))
 
@@ -308,7 +388,7 @@ class SegmentationTrainer:
 
                 target_orig = slice_tensor_at_label(orig_mask, label_idx)
                 prob_upsampled = torch.nn.functional.interpolate(pred_probs,  
-                                                size=orig_shape, 
+                                                size=(1,*orig_shape), 
                                                 mode='nearest')
                 
                 iou = SegmentationTrainer.compute_iou(pred_probs, target)
