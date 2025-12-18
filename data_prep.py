@@ -193,10 +193,10 @@ class MitralValveDataset(Dataset):
 
         # Apply rotation augmentation (only for train mode)
         if apply_rotation:
-            seq = ndimage.rotate(seq, angle, axes=(1, 2), reshape=False)
+            seq = ndimage.rotate(seq, angle, axes=(1, 2), reshape=False, order=0, prefilter=False)
             if mask_seq is not None:
-                mask_seq = ndimage.rotate(mask_seq, angle, axes=(1, 2), reshape=False)
-            box = ndimage.rotate(box, angle, axes=(0, 1), reshape=False)
+                mask_seq = ndimage.rotate(mask_seq, angle, axes=(1, 2), reshape=False, order=0, prefilter=False)
+            box = ndimage.rotate(box, angle, axes=(0, 1), reshape=False, order=0, prefilter=False)
             # Safety: Re-threshold to binary (eliminate float artifacts)
             if mask_seq is not None:
                 mask_seq = (mask_seq > 0.5).astype(np.bool_)
@@ -213,9 +213,11 @@ class MitralValveDataset(Dataset):
                     mask_resized[t, :, :] = resize_frame(mask_seq[t, :, :], self.target_size, method='linear')
             box_resized = resize_frame(box, self.target_size, method='nearest')
         else:
+            assert seq.shape == mask_seq.shape, f"Expected seq.shape {seq.shape}, got {mask_seq.shape}"
+            #all shapes always need to be divisible by 16 because of the model architecture
+            assert seq.shape[1] % 16 == 0 and seq.shape[2] % 16 == 0, f"Expected seq.shape[1] and seq.shape[2] to be divisible by 16, got {seq.shape[1:3]}"
             seq_resized = seq
-            if mask_seq is not None:
-                mask_resized = mask_seq
+            mask_resized = mask_seq
             box_resized = box
         
         # Add channel dimension: (T, H, W) -> (1, T, H, W)

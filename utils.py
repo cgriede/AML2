@@ -105,6 +105,12 @@ def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int]) -> torch.Ten
 
     return torch.cat(slices, dim=0)  # (N_total, C, H, W)
 
+def write_configuration_string(HYPERPARAMETERS):
+    configuration_string = ""
+    for key, value in HYPERPARAMETERS.items():
+        configuration_string += f"{key}: {value}\n"
+    return configuration_string
+
 if __name__ == "__main__":
     x, y = dimension_scaler(15)
     print(x, y, "n_voxels", f"{x * y:.3e}")

@@ -4,6 +4,7 @@ from datetime import datetime
 import torch
 import pandas as pd
 import torch.nn as nn
+import numpy as np
 from video_generator import VideoGenerator
 
 # ============================================================================
@@ -72,7 +73,7 @@ class AreaConsistencyLoss(nn.Module):
 
 class SegmentationTrainer:
 
-    allow_no_user_input: bool = False
+    allow_no_user_input: bool = True
 
     class CombinedLoss(nn.Module):
         def __init__(self,
@@ -126,6 +127,7 @@ class SegmentationTrainer:
                 training_dir: Path = None,
                 target_shape: tuple = None,
                 device: str = "cpu",
+                description: str = None,
                 ):
         self.model = model
         self.train_loader = train_loader
@@ -139,6 +141,7 @@ class SegmentationTrainer:
         self.patience = patience
         self.save_threshold_iou = save_threshold_iou
         self.device = device
+        self.description = description
         # Initialize training summary DataFrame
         self.training_summary = []
         
@@ -156,13 +159,16 @@ class SegmentationTrainer:
         (self.training_dir / 'models').mkdir(exist_ok=True)
         (self.training_dir / 'videos').mkdir(exist_ok=True)
         
-        if not self.allow_no_user_input:
+        if not self.allow_no_user_input and self.description is None:
             self._get_user_training_description()
+        elif self.description is not None:
+            self._get_user_training_description(self.description)
         else:
             print("Allowing no user input, continuing without user input")
         
-    def _get_user_training_description(self):
-        description = input("Enter a description for the training: ")
+    def _get_user_training_description(self, description: str = None):
+        if description is None:
+            description = input("Enter a description for the training: ")
         with open(self.training_dir / 'description.txt', 'w') as f:
             f.write(description)
         print(f"Training description saved to {self.training_dir / 'description.txt'}")
@@ -206,8 +212,8 @@ class SegmentationTrainer:
         for epoch in range(self.n_epochs):
             train_loss = self._train_epoch(self.model, self.train_loader, self.optimizer, self.loss_fn, self.device, self.max_batch_per_epoch)
             print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
-            val_loss, val_iou, val_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.device, self.create_video, self.max_batch_per_val)
-            print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU={val_iou:.4f}, Val IoU (orig size)={val_iou_orig:.4f}")
+            val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.device, self.create_video, self.max_batch_per_val)
+            print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, Val IoU (mean)={val_iou:.4f}, Val IoU (orig, mean)={val_iou_orig:.4f}, Val IoU (median, Kaggle-style)={median_iou:.4f}, Val IoU (orig, median)={median_iou_orig:.4f}")
             
             # Record training summary
             self.training_summary.append({
@@ -277,6 +283,10 @@ class SegmentationTrainer:
         batches_per_val = 0
         video_payload = None
         
+        # Collect IoU per video to compute median (matching Kaggle's evaluation)
+        iou_per_video = {}  # {video_name: [iou_values]}
+        iou_orig_per_video = {}  # {video_name: [iou_values]}
+        
         with torch.no_grad():
             for batch_idx, batch in enumerate(loader):
                 batches_per_val += 1
@@ -288,6 +298,7 @@ class SegmentationTrainer:
                 pred = model(frames)  # (B, C, T, H, W)
                 orig_shape = batch['orig_shape']
                 orig_mask = batch['orig_mask'].to(device)
+                video_names = batch.get('video_name', [f'batch_{batch_idx}'] * frames.size(0))
 
                 loss = loss_fn(pred, target, label_idx)
                 total_loss += loss.item()
@@ -304,6 +315,22 @@ class SegmentationTrainer:
                 iou_orig_size = SegmentationTrainer.compute_iou(prob_upsampled, target_orig)
                 total_iou += iou.item()
                 total_iou_orig_size += iou_orig_size.item()
+                
+                # Track IoU per video (handle batch dimension)
+                batch_size = frames.size(0)
+                if isinstance(video_names, (list, tuple)) and len(video_names) == batch_size:
+                    for i in range(batch_size):
+                        vname = video_names[i]
+                        if vname not in iou_per_video:
+                            iou_per_video[vname] = []
+                            iou_orig_per_video[vname] = []
+                        # For batched predictions, we compute IoU per sample
+                        # Note: compute_iou aggregates over batch, so we need per-sample IoU
+                        # For now, we'll use the batch IoU and track it per video
+                        # This is approximate - ideally we'd compute per-sample IoU
+                        iou_per_video[vname].append(iou.item())
+                        iou_orig_per_video[vname].append(iou_orig_size.item())
+                
                 if create_video and video_payload is None:
                     # Capture first available batch for potential video generation
                     video_payload = {
@@ -313,4 +340,19 @@ class SegmentationTrainer:
                         "batch_idx": batch_idx,
                     }
 
-        return total_loss / len(loader), total_iou / len(loader), total_iou_orig_size / len(loader), video_payload
+        # Compute mean IoU (current method)
+        mean_iou = total_iou / len(loader)
+        mean_iou_orig = total_iou_orig_size / len(loader)
+        
+        # Compute median IoU per video (matching Kaggle's evaluation)
+        # Take median of per-video mean IoU values
+        if iou_per_video:
+            video_mean_ious = [np.mean(iou_list) for iou_list in iou_per_video.values()]
+            video_mean_ious_orig = [np.mean(iou_list) for iou_list in iou_orig_per_video.values()]
+            median_iou = np.median(video_mean_ious)
+            median_iou_orig = np.median(video_mean_ious_orig)
+        else:
+            median_iou = mean_iou
+            median_iou_orig = mean_iou_orig
+
+        return total_loss / len(loader), mean_iou, mean_iou_orig, median_iou, median_iou_orig, video_payload

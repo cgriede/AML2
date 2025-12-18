@@ -14,9 +14,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from pathlib import Path
+from utils import write_configuration_string
 
 from mednext import create_mednext_v1
-from data_prep import load_zipped_pickle, MitralValveDataset
+from data_prep import load_zipped_pickle, MitralValveDataset, DatasetType   
 from trainer import SegmentationTrainer
 from predictor import SegmentationPredictor
 
@@ -134,7 +135,6 @@ def main_train():
     # Setup machine configuration (called here to avoid multiprocessing print issues)
     DEVICE, batch_size, sequence_length, TARGET_SHAPE, NUM_WORKERS = setup_machine_config(workspace="home_station")
     
-    EVAL = False
     DEBUG = False
     create_video = True
 
@@ -145,66 +145,105 @@ def main_train():
         max_batch_per_epoch = 1e3
         max_batch_per_val = 1e3
 
-    
     ######HYPERPARAMETERS######################################################
-    learning_rate: float = 1e-3
-    n_epochs: int = 20
-    model_id: str = 'S'
-    rotation_chance: float = 0.0
-    random_label_position: bool = False
+    HYPERPARAMETERS = {
+        "learning_rate": 1e-3,
+        "n_epochs_expert": 20,
+        "n_epochs_amateur": 10,
+        "model_id": 'S',
+        "random_label_position": True,
+        "rotation_chance": 0.8,
+    }
+    learning_rate = HYPERPARAMETERS["learning_rate"]
+    n_epochs_expert = HYPERPARAMETERS["n_epochs_expert"]
+    n_epochs_amateur = HYPERPARAMETERS["n_epochs_amateur"]
+    model_id = HYPERPARAMETERS["model_id"]
+    rotation_chance = HYPERPARAMETERS["rotation_chance"]
+    random_label_position = HYPERPARAMETERS["random_label_position"]
+    ############################################################
     print(f"Using target shape: {TARGET_SHAPE}, sequence length {sequence_length}, batch size {batch_size}")
+    model = SegmentationNet(n_frames=sequence_length, model_id=model_id).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
     # Load data
     train_data = load_zipped_pickle('train.pkl')
     print(f"Loaded {len(train_data)} training videos\n")
-    if EVAL:
-        print("Evaluating on test set")
-        test_data = load_zipped_pickle('test.pkl')
-        print(f"Loaded {len(test_data)} test videos\n")
+    train_data_expert = [item for item in train_data if item.get("dataset") == "expert"]
+    train_split_ex, val_split_ex = random_split(train_data_expert, [0.8, 0.2])
 
-    # Split the raw data before creating the dataset from sequences
-    num_val = int(0.2 * len(train_data))
-    # Create generator with correct device to avoid device mismatch error
-    train_split, val_split = random_split(train_data, [len(train_data) - num_val, num_val])
-    train_ds = MitralValveDataset(train_split, mode="train", target_size=TARGET_SHAPE,
+    train_ds_expert = MitralValveDataset(train_split_ex, mode="train", target_size=TARGET_SHAPE,
     random_label_position=random_label_position,
     rotation_chance=rotation_chance,
     rotation_angle=20,
+    dataset_type=DatasetType.EXPERT
     )
-    val_ds = MitralValveDataset(val_split, mode="val", target_size=TARGET_SHAPE)
-    print(f"Train: {len(train_ds)}, Val: {len(val_ds)}")
+    val_ds_expert = MitralValveDataset(val_split_ex, mode="val", target_size=TARGET_SHAPE)
 
-    train_loader = DataLoader(train_ds,
+    train_loader_expert = DataLoader(train_ds_expert,
     batch_size=batch_size,
     shuffle=True,
     num_workers=NUM_WORKERS,
     persistent_workers=True,
     )
-    val_loader = DataLoader(val_ds,
+    val_loader_expert = DataLoader(val_ds_expert,
     batch_size=batch_size,
     num_workers=NUM_WORKERS,
     persistent_workers=True,
     )
     
-    # Quick test instantiation (run this to verify)
-    model = SegmentationNet(n_frames=sequence_length, model_id=model_id).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    
-    # Use the new SegmentationTrainer class
-    trainer = SegmentationTrainer(
+    if n_epochs_amateur > 0:
+        train_data_amateur = [item for item in train_data if item.get("dataset") == "amateur"]
+        train_ds_amateur = MitralValveDataset(train_data_amateur, mode="train", target_size=None, #no rescaling since 112x112 shape
+        random_label_position=random_label_position,
+        rotation_chance=rotation_chance,
+        rotation_angle=20,
+        dataset_type=DatasetType.AMATEUR
+        )
+        val_ds_amateur = MitralValveDataset(train_data_expert, mode="val", target_size=TARGET_SHAPE,
+        dataset_type=DatasetType.EXPERT
+        )
+
+        train_loader_amateur = DataLoader(train_ds_amateur,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        persistent_workers=True,
+        )
+        val_loader_amateur = DataLoader(val_ds_amateur,
+        batch_size=batch_size,
+        num_workers=NUM_WORKERS,
+        persistent_workers=True,
+        )
+        trainer_amateur = SegmentationTrainer(
         model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
+        train_loader=train_loader_amateur,
+        val_loader=val_loader_amateur,
         optimizer=optimizer,
-        n_epochs=n_epochs,
+        n_epochs=n_epochs_amateur,
         create_video=create_video,
         max_batch_per_epoch=max_batch_per_epoch,
         max_batch_per_val=max_batch_per_val,
         target_shape=TARGET_SHAPE,
-        device=DEVICE
+        device=DEVICE,
+        description=("AMATEUR TRAINING\n" + write_configuration_string(HYPERPARAMETERS))
+        )
+        trainer_amateur.train_model()
+
+    # Use the new SegmentationTrainer expert class
+    trainer_expert = SegmentationTrainer(
+        model=model,
+        train_loader=train_loader_expert,
+        val_loader=val_loader_expert,
+        optimizer=optimizer,
+        n_epochs=n_epochs_expert,
+        create_video=create_video,
+        max_batch_per_epoch=max_batch_per_epoch,
+        max_batch_per_val=max_batch_per_val,
+        target_shape=TARGET_SHAPE,
+        device=DEVICE,
+        description=("EXPERT TRAINING\n" + write_configuration_string(HYPERPARAMETERS))
     )
-    trainer.train_model()
-    return None
+    trainer_expert.train_model()
 
 def main_predict(model_path: Path, expected_iou: float = 0.5):
     """
@@ -274,7 +313,12 @@ def main_predict(model_path: Path, expected_iou: float = 0.5):
     return predictions, output_file
 
 if __name__ == '__main__':
-    main_predict(
-        model_path=Path('D:/ETH/Master/AML/AML2/training/20251218_015707_dim160x224/models/ep010_iou05430.pt'),
-        expected_iou=0.5430
-    )
+    mode = "train"
+    if mode == "train":
+        main_train()
+    elif mode == "predict":
+        main_predict(
+            model_path=Path('D:/ETH/Master/AML/AML2/training/20251218_015707_dim160x224/models/ep010_iou05430.pt'),
+            expected_iou=0.5430
+        )
+
