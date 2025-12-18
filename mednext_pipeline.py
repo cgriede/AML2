@@ -359,17 +359,13 @@ def main_train_finetune_no_val():
 
     if DEBUG:
         max_batch_per_epoch = 1
-        max_batch_per_val = 1
     else:
         max_batch_per_epoch = 1e3
-        max_batch_per_val = 1e3
 
     ######HYPERPARAMETERS######################################################
     HYPERPARAMETERS = {
-        "learning_rate": 1e-3,
-        "upkernel_lr": 1e-4,
-        "n_epochs_amateur": 100,
-        "n_epochs_expert": 30,
+        "upkernel_lr": 5e-5,
+        "n_epochs_expert": 100,
         "model_id": 'S',
         "random_label_position": True,
         "rotation_chance": 0.8,
@@ -424,7 +420,7 @@ def main_train_finetune_no_val():
         target_shape=TARGET_SHAPE,
         device=DEVICE,
         deep_supervision=deep_supervision,
-        save_threshold_loss=0.17,
+        save_threshold_iou=0.5,
         no_validation=True,
         description=("EXPERT TRAINING Full Data Finetune\n" + write_configuration_string(HYPERPARAMETERS))
     )

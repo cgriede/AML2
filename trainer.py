@@ -187,7 +187,6 @@ class SegmentationTrainer:
                 max_batch_per_val:int = 1e3,
                 patience: int = 50,
                 save_threshold_iou: float = 0.4,
-                save_threshold_loss: float = 0.17,
                 training_dir: Path = None,
                 target_shape: tuple = None,
                 device: str = "cpu",
@@ -206,7 +205,6 @@ class SegmentationTrainer:
         self.max_batch_per_val = max_batch_per_val
         self.patience = patience
         self.save_threshold_iou = save_threshold_iou
-        self.save_threshold_loss = save_threshold_loss
         self.device = device
         self.deep_supervision = deep_supervision
         self.description = description
@@ -248,6 +246,7 @@ class SegmentationTrainer:
         model.train()
         total_loss = 0.0
         batches_per_epoch = 0
+        train_iou = 0.0
         
         for batch_idx, batch in enumerate(loader):
             batches_per_epoch += 1
@@ -264,16 +263,21 @@ class SegmentationTrainer:
             optimizer.step()
             optimizer.zero_grad()
             total_loss += loss.item()
-        return total_loss / len(loader)
+            with torch.no_grad():
+                if self.deep_supervision:
+                    logits = logits[0]
+                pred_probs = torch.sigmoid(slice_tensor_at_label(logits, label_idx))
+                target = slice_tensor_at_label(target, label_idx)
+                train_iou += self.compute_iou(pred_probs, target).item()
+        return total_loss / len(loader), train_iou / len(loader)
 
     def train_model(self):
-        best_iou = 0.0
+        best_val_iou = 0.0
+        best_train_iou = 0.0
         patience = 0
-        best_loss = float('inf')
-        
         for epoch in range(self.n_epochs):
-            train_loss = self._train_epoch(self.model, self.train_loader, self.optimizer, self.loss_fn, self.device, self.max_batch_per_epoch)
-            print(f"Epoch {epoch+1}: Loss={train_loss:.4f}")
+            train_loss, train_iou = self._train_epoch(self.model, self.train_loader, self.optimizer, self.loss_fn, self.device, self.max_batch_per_epoch)
+            print(f"Epoch {epoch+1}: Loss={train_loss:.4f}, Train IoU={train_iou:.4f}")
             if not self.no_validation:
                 val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.device, self.create_video, self.max_batch_per_val)
                 print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, \n\tVal IoU (mean)={val_iou:.4f}, \n\tVal IoU (orig, mean)={val_iou_orig:.4f}, \n\tVal IoU (median, Kaggle-style)={median_iou:.4f}, \n\tVal IoU (orig, median)={median_iou_orig:.4f}")
@@ -281,6 +285,7 @@ class SegmentationTrainer:
                 self.training_summary.append({
                     'epoch': epoch + 1,
                     'train_loss': train_loss,
+                    'train_iou': train_iou,
                     'val_loss': val_loss,
                     'val_iou': val_iou,
                     'val_iou_orig': val_iou_orig,
@@ -288,31 +293,26 @@ class SegmentationTrainer:
                     'median_iou_orig': median_iou_orig
                 })
             else:
-                val_loss = float('inf')
-                val_iou = 0.0
-                val_iou_orig = 0.0
-                median_iou = 0.0
-                median_iou_orig = 0.0
-                video_payload = None
 
                 self.training_summary.append({
                     'epoch': epoch + 1,
                     'train_loss': train_loss,
+                    'train_iou': train_iou,
                 })
             
-            if val_iou > best_iou:
-                best_iou = val_iou
+            if val_iou > best_val_iou or train_iou > best_train_iou:
+                if self.no_validation:
+                    best_train_iou = train_iou
+                else:
+                    best_val_iou = val_iou
                 patience = 0
-                if train_loss < best_loss:
-                    best_loss = train_loss
-                    patience = 0
                 # Delete previous best model if exists
                 if self.best_model_path is not None and self.best_model_path.exists():
                     self.best_model_path.unlink(missing_ok=True)
                 
-                if val_iou > self.save_threshold_iou or train_loss < self.save_threshold_loss:
+                if max(best_val_iou, best_train_iou) > self.save_threshold_iou:
                     # Save new best model to training_dir/models
-                    iou_string = f'iou{val_iou:.4f}'.replace('.', '')
+                    iou_string = f'iou{max(best_val_iou, best_train_iou):.4f}'.replace('.', '')
                     model_filename = f'ep{epoch+1:03d}_iou{iou_string}.pt'
                     self.best_model_path = self.training_dir / 'models' / model_filename
                     torch.save(self.model.state_dict(), self.best_model_path)
