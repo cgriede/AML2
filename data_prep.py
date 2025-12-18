@@ -160,6 +160,18 @@ class MitralValveDataset(Dataset):
             # Train mode with random label position
             sequence_label_idx = random.randint(0, self.seq_len - 1)
             start_idx = center_idx - sequence_label_idx
+        
+        # Collect all labeled frames within sequence range
+        if self.mode != "test":
+            labeled_frames = item.get('frames', [])
+            end_idx = start_idx + self.seq_len - 1
+            all_label_indices = [sequence_label_idx]
+            for labeled_frame in labeled_frames:
+                if start_idx <= labeled_frame <= end_idx:
+                    rel_idx = labeled_frame - start_idx
+                    if rel_idx != sequence_label_idx:
+                        all_label_indices.append(rel_idx)
+            sequence_label_idx = sorted(all_label_indices)
 
         # Extract frames with reflective padding
         # Time-first layout so frames are stored as [t, h, w]
@@ -240,6 +252,7 @@ class MitralValveDataset(Dataset):
             # label_idx indicates which frame in the sequence is the center frame (for mask extraction)
             result['frame_idx'] = center_idx  # Original frame index in video
             result['label_idx'] = sequence_label_idx  # Frame index in sequence (center frame)
+            result['video_length'] = num_frames
         else:
             # Train/Val mode: return frame, mask, box, label_idx, video_name, orig_shape
             result['mask'] = torch.from_numpy(mask_resized)

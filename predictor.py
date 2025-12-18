@@ -78,143 +78,74 @@ def _postprocess_video(video_data):
 
 class SegmentationPredictor:
     """Predictor class for generating test predictions and submission files"""
+
+    def __init__(self, model, loader, device, seq_len: int = 16, num_postprocess_workers: int = None, test_data: list = None, deep_supervision: bool = False, probability_threshold: float = 0.5):
+        self.model = model
+        self.loader = loader
+        self.device = device
+        self.seq_len = seq_len
+        self.num_postprocess_workers = num_postprocess_workers
+        self.test_data = test_data
+        self.deep_supervision = deep_supervision
+        self.probability_threshold = probability_threshold
     
-    @staticmethod
-    def predict_test(model, loader, device, seq_len: int = 16, num_postprocess_workers: int = None, test_data: list = None):
+    def predict_test(self):
         """
-        Generate predictions for test set - extract center frame from 3D output.
-        Buffers probabilities per video, then postprocesses in parallel worker processes
-        to keep GPU busy during postprocessing.
-        
-        Args:
-            model: Trained model
-            loader: DataLoader for test data
-            device: Device to run inference on
-            seq_len: Sequence length used by the model
-            num_postprocess_workers: Number of worker processes for postprocessing (default: cpu_count - 1)
-            test_data: Original test data list (optional, used to verify original video shapes)
-        
-        Returns:
-            dict: Predictions in format {name: full_mask_array (H, W, T)}
+        Generate predictions for the test set.
+        - Model outputs (B, 1, T, H, W)
+        - We extract the center frame (defined by label_idx)
+        - Upsample to original spatial resolution if needed
+        - Reconstruct full-video mask with predictions only at center frames
         """
-        if num_postprocess_workers is None:
-            raise ValueError("num_postprocess_workers must be provided")
-        
-        model.eval()
-        # Buffer predictions per video: {name: {frame_idx: {'probs': array, 'orig_shape': tuple}}}
-        video_buffers = {}
-        
-        print("Generating predictions on GPU...")
+        self.model.eval()
+        predictions = {}  # {video_name: np.array (H_orig, W_orig, T)}
+
         with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(loader, desc="Predicting")):
-                frames = batch['frame'].to(device)
-                names = batch['name']
-                frame_indices = batch['frame_idx'].cpu().numpy()
-                label_indices = batch['label_idx']  # Frame index in sequence to extract (center frame)
-                orig_shapes = batch.get('orig_shape', None)
-                
-                try:
-                    pred = model(frames)  # Shape: (B, C, T, H, W)
-                except Exception as e:
-                    print(f"[ERROR][predict] model forward failed: {e}")
-                    raise
-                
-                # Extract frame at label_idx from the sequence (same as validation)
-                pred_center = slice_tensor_at_label(pred, label_indices)  # (B, C, H, W)
-                pred_probs = torch.sigmoid(pred_center)  # Convert logits to probabilities
-                
-                # Move probabilities to CPU and store (don't convert to binary yet)
-                pred_probs_cpu = pred_probs.cpu().numpy()  # (B, C, H, W)
-                
+            for batch in tqdm(self.loader, desc="Predicting test"):
+                frames = batch['frame'].to(self.device)           # (B, C, T, H, W)
+                names = batch['name']                             # list of str
+                frame_indices = batch['frame_idx'].cpu().numpy() # global frame idx in video
+                label_indices = batch['label_idx']                # center frame idx in sequence
+                orig_shapes = batch.get('orig_shape')             # list of (H_orig, W_orig) or None
+                video_lengths = batch.get('video_length')          # list of int
+
+                # Forward pass
+                logits = self.model(frames)                       # may be list if deep_supervision
+                if self.deep_supervision:
+                    logits = logits[0]                            # use finest head
+
+                # Extract center frame prediction (B, 1, H, W)
+                center_logits = slice_tensor_at_label(logits, label_indices)
+                center_probs = torch.sigmoid(center_logits)  # (B, 1, 1, H, W)
+
+                # Process each video in batch
                 for i, name in enumerate(names):
-                    if name not in video_buffers:
-                        video_buffers[name] = {}
-                    
-                    frame_idx = int(frame_indices[i])
-                    
-                    # Handle orig_shape - convert to tuple if needed
-                    if orig_shapes is not None:
-                        orig_shape_raw = orig_shapes[i]
-                        # Convert to tuple if it's a tensor or list
-                        if isinstance(orig_shape_raw, (torch.Tensor, np.ndarray)):
-                            orig_shape = tuple(orig_shape_raw.tolist() if hasattr(orig_shape_raw, 'tolist') else orig_shape_raw)
-                        elif isinstance(orig_shape_raw, (list, tuple)):
-                            orig_shape = tuple(orig_shape_raw)
-                        else:
-                            orig_shape = orig_shape_raw
-                    else:
-                        orig_shape = None
-                    
-                    # Store probabilities (not binary yet) - will postprocess later
-                    # Extract probabilities: (C, H, W) -> (H, W)
-                    probs = pred_probs_cpu[i, 0, :, :]  # Remove channel dimension
-                    
-                    video_buffers[name][frame_idx] = {
-                        'probs': probs,
-                        'orig_shape': orig_shape
-                    }
-        
-        print(f"Postprocessing {len(video_buffers)} videos using {num_postprocess_workers} workers...")
-        
-        # Create a mapping from video name to original shape from test_data (if provided)
-        test_data_shape_map = {}
-        if test_data is not None:
-            for item in test_data:
-                name = item['name']
-                # Get original video shape: (H, W, T) -> (H, W)
-                orig_video_shape = item['video'].shape[:2]
-                test_data_shape_map[name] = orig_video_shape
-        
-        # Prepare data for parallel postprocessing
-        # Get orig_shape from first frame prediction for each video, but verify with test_data
-        video_data_list = []
-        for name, frame_predictions in video_buffers.items():
-            # Get orig_shape from first frame (should be same for all frames of same video)
-            first_frame_data = next(iter(frame_predictions.values()))
-            orig_shape = first_frame_data['orig_shape']
-            
-            # Ensure orig_shape is a tuple of 2 integers
-            if orig_shape is not None:
-                if isinstance(orig_shape, (torch.Tensor, np.ndarray)):
-                    orig_shape = tuple(orig_shape.tolist() if hasattr(orig_shape, 'tolist') else orig_shape)
-                elif isinstance(orig_shape, (list, tuple)):
-                    orig_shape = tuple(orig_shape)
-            
-            # Verify with test_data if available (this is the ground truth original shape)
-            if name in test_data_shape_map:
-                test_orig_shape = test_data_shape_map[name]
-                # Use test_data shape as the authoritative source
-                orig_shape = test_orig_shape
-                print(f"Using original shape from test_data for {name}: {orig_shape}")
-            elif orig_shape is None:
-                # Fallback: use shape from probabilities (this means no upsampling needed)
-                orig_shape = first_frame_data['probs'].shape
-                print(f"Warning: No orig_shape found for {name}, using prob shape {orig_shape} (no upsampling)")
-            else:
-                # Check if orig_shape matches prob shape (means it's already resized)
-                prob_shape = first_frame_data['probs'].shape
-                if orig_shape == prob_shape:
-                    print(f"Warning: orig_shape matches prob shape for {name}: {orig_shape} - this might be wrong!")
-                    # If they match, it means orig_shape is actually the resized shape, not original
-                    # We can't fix this without test_data, so warn the user
-                else:
-                    print(f"Using orig_shape from batch for {name}: {orig_shape} (prob shape: {prob_shape})")
-            
-            # Final validation: ensure we have (H, W)
-            if not isinstance(orig_shape, tuple) or len(orig_shape) != 2:
-                raise ValueError(f"Invalid orig_shape for video {name}: {orig_shape}, expected (H, W) tuple")
-            
-            video_data_list.append((name, frame_predictions, orig_shape))
-        
-        # Postprocess videos in parallel (using module-level function for multiprocessing)
-        with Pool(processes=num_postprocess_workers) as pool:
-            results = pool.map(_postprocess_video, video_data_list)
-        
-        # Convert results list to dictionary
-        results_dict = {name: mask for name, mask in results if mask is not None}
-        
-        print(f"Postprocessing complete. Generated masks for {len(results_dict)} videos.")
-        return results_dict
+                    prob = center_probs[i]# (1, 1, H, W)
+                    H_orig, W_orig = orig_shapes[0], orig_shapes[1]
+                    T = video_lengths[i]
+                    # Upsample to original resolution if needed
+                    if (H_orig, W_orig) != prob.shape:
+                        prob = torch.nn.functional.interpolate(
+                            prob,
+                            size=(H_orig, W_orig),
+                            mode='nearest'
+                        ).cpu().numpy() # (H, W)
+
+                    global_frame_idx = int(frame_indices[i])
+
+                    # Initialize full mask if first time seeing this video
+                    if name not in predictions:
+                        # Get total frames T from test_data or infer from max index + 1
+                        predictions[name] = np.zeros((H_orig, W_orig, T), dtype=np.bool_)
+
+                    # Place prediction at correct global frame
+                    predictions[name][:, :, global_frame_idx] = (prob > self.probability_threshold)
+
+                    center_in_seq = label_indices[i]  # or however you get center
+                    print(f"Video {name}: placing prediction at global frame {global_frame_idx}")
+                    print(f"  (center in sequence: {center_in_seq}, sequence length: {frames.shape[2]})")
+
+        return predictions
         
     @staticmethod
     def get_sequences(arr):
@@ -241,7 +172,7 @@ class SegmentationPredictor:
         return first_indices, lengths
 
     @staticmethod
-    def save_submission(predictions, test_data, expected_iou: float, output_dir: Path = None):
+    def save_submission(predictions, test_data, expected_iou: float, path_notes:str = "",  output_dir: Path = None):
         """
         Save predictions as CSV submission file in the format of sample.csv.
         Format: id,value where value is RLE encoding as string "[start, length]"
@@ -255,7 +186,7 @@ class SegmentationPredictor:
         if output_dir is None:
             timestamp = datetime.now().strftime("%Y%m%d")
             iou_str = f"{expected_iou:.4f}".replace('.', '')
-            output_dir = Path('results') / f"{timestamp}_{iou_str}"
+            output_dir = Path('results') / f"{timestamp}_{iou_str}_{path_notes}"
         
         output_dir.mkdir(parents=True, exist_ok=True)
         output_file = output_dir / 'submission.csv'
@@ -270,14 +201,6 @@ class SegmentationPredictor:
                 continue
             
             mask = predictions[name]  # (H, W, T) boolean array
-
-            with open(output_dir / f"{name}.npy", 'wb') as f:
-                np.save(f, mask)
-            
-            #NOTE: this might work if the new does not
-            # Transpose to (T, H, W) first, then flatten row-major
-            #flattened = np.transpose(mask, (2, 0, 1)).flatten(order='C')
-
 
             # Flatten entire video mask: (H, W, T) -> (H*W*T,) in row-major order
             # This flattens frame by frame: all pixels of frame 0, then frame 1, etc.

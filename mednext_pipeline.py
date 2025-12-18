@@ -46,8 +46,9 @@ MACHINE_CONFIGS = {
         "NUM_CPUS": 16,
         "RAM_GB": 64,
         "DEVICE": "cuda",
-        "MAX_INPUT_SIZE" : (1, 1, 16, 160, 224),  #high performance, for fast dev
+        "MAX_INPUT_SIZE" : (1, 1, 80, 224, 304),
         #"MAX_INPUT_SIZE" : (1, 1, 16, 320, 432), #works with high res, 8s / sample
+        #"MAX_INPUT_SIZE" : (1, 1, 16, 160, 224),  #high performance, for fast dev
     },
     "hpc_euler_32" : {
         "NUM_CPUS": 32,
@@ -149,7 +150,7 @@ def main_train():
     HYPERPARAMETERS = {
         "learning_rate": 1e-3,
         "upkernel_lr": 3e-4,
-        "n_epochs_amateur": 100,
+        "n_epochs_amateur": 50,
         "n_epochs_expert": 30,
         "model_id": 'S',
         "random_label_position": True,
@@ -183,9 +184,12 @@ def main_train():
     random_label_position=random_label_position,
     rotation_chance=rotation_chance,
     rotation_angle=20,
-    dataset_type=DatasetType.EXPERT
+    dataset_type=DatasetType.EXPERT,
+    seq_len=sequence_length,
     )
-    val_ds_expert = MitralValveDataset(val_split_ex, mode="val", target_size=TARGET_SHAPE)
+    val_ds_expert = MitralValveDataset(val_split_ex, mode="val", target_size=TARGET_SHAPE,
+    seq_len=sequence_length
+    )
 
     train_loader_expert = DataLoader(train_ds_expert,
     batch_size=batch_size,
@@ -204,10 +208,14 @@ def main_train():
     random_label_position=random_label_position,
     rotation_chance=rotation_chance,
     rotation_angle=20,
-    dataset_type=DatasetType.AMATEUR
+    dataset_type=DatasetType.AMATEUR,
+    seq_len=sequence_length,
     )
-    val_ds_amateur = MitralValveDataset(train_data_expert, mode="val", target_size=TARGET_SHAPE,
-    dataset_type=DatasetType.EXPERT
+    #use 30% of the expert data for validation
+    val_data_amateur, _ = random_split(train_data_expert, [0.3, 0.7])
+    val_ds_amateur = MitralValveDataset(val_data_amateur, mode="val", target_size=TARGET_SHAPE,
+    dataset_type=DatasetType.EXPERT,
+    seq_len=sequence_length
     )
 
     train_loader_amateur = DataLoader(train_ds_amateur,
@@ -426,7 +434,7 @@ def main_train_finetune_no_val():
     )
     trainer_expert.train_model()
 
-def main_predict(model_path: Path, expected_iou: float = 0.5):
+def main_predict(model_path: Path, expected_iou: float = 0.5, probability_threshold: float = 0.5, path_notes: str = ""):
     """
     Generate predictions for test set and save submission file.
     
@@ -438,7 +446,7 @@ def main_predict(model_path: Path, expected_iou: float = 0.5):
     DEVICE, batch_size, sequence_length, TARGET_SHAPE, NUM_WORKERS = setup_machine_config(workspace="home_station")
     
     # Load model
-    model = SegmentationNet(n_frames=sequence_length, model_id='S').to(DEVICE)
+    model = SegmentationNet(n_frames=sequence_length, model_id='S', kernel_size=7, deep_supervision=True).to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
     model.eval()
     print(f"Loaded model from {model_path}")
@@ -462,23 +470,31 @@ def main_predict(model_path: Path, expected_iou: float = 0.5):
     
     # Generate predictions
     print("Generating predictions...")
-    predictions = SegmentationPredictor.predict_test(
+    predictor = SegmentationPredictor(
         model=model,
         loader=test_loader,
         device=DEVICE,
         seq_len=sequence_length,
         num_postprocess_workers=2,
-        test_data=test_data  # Pass test_data to verify original shapes
+        test_data=test_data,
+        deep_supervision=True,
+        probability_threshold=probability_threshold
     )
+    predictions = predictor.predict_test()
     
     # Save submission file
     print("Saving submission file...")
     output_file, output_dir = SegmentationPredictor.save_submission(
         predictions=predictions,
         test_data=test_data,
-        expected_iou=expected_iou
+        expected_iou=expected_iou,
+        path_notes=path_notes
     )
-    generate_videos = False
+
+    cmd = f'kaggle competitions submit -c eth-aml-2025-project-task-2 -f {output_file} -m "{path_notes + " " + str(expected_iou)}"'
+    os.system(cmd)
+    print(f"Submission sent to Kaggle")
+    generate_videos = True
     if generate_videos:
         # Generate visualization videos
         print("Generating visualization videos...")
@@ -494,7 +510,7 @@ def main_predict(model_path: Path, expected_iou: float = 0.5):
     return predictions, output_file
 
 if __name__ == '__main__':
-    mode = "train_finetune_no_val"
+    mode = "train"
     if mode == "train":
         main_train()
     elif mode == "train_expert":
@@ -502,8 +518,13 @@ if __name__ == '__main__':
     elif mode == "train_finetune_no_val":
         main_train_finetune_no_val()
     elif mode == "predict":
-        main_predict(
-            model_path=Path('D:/ETH/Master/AML/AML2/training/20251218_015707_dim160x224/models/ep010_iou05430.pt'),
-            expected_iou=0.5430
-        )
+        thresholds = [0.45]
+        for threshold in thresholds:
+            print(f"Predicting with probability threshold {threshold}")
+            main_predict(
+                model_path=Path(r'D:\ETH\Master\AML\AML2\training\20251218_193011_dim160x224\models\ep086_iouiou06163.pt'),
+                expected_iou=0.6163,
+                probability_threshold=threshold,
+                path_notes=f"threshold_045"
+            )
 

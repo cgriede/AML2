@@ -5,7 +5,9 @@ import torch
 import pandas as pd
 import torch.nn as nn
 import numpy as np
+import time
 from video_generator import VideoGenerator
+from torch.amp import GradScaler, autocast
 
 # ============================================================================
 # LOSS FUNCTIONS
@@ -134,10 +136,21 @@ class SegmentationTrainer:
                 stride_t = orig_T // current_T  # e.g., 1, 2, 4, 8, 16
 
                 # Scale label indices to this resolution
-                # Scale label indices to this resolution
+                # label_idx is a list where each element can be a single int or a list of ints
                 scaled_label_idx = []
-                for idx in label_idx:  # idx_tensor is always 1D tensor (shape (N,) or (1,))  # converts to Python list of ints, works for both [8] and [41,65,167]
-                    scaled = [idx // stride_t]
+                for idx in label_idx:  # idx can be a single int or a list of ints
+                    # Handle both single int and list of ints
+                    if isinstance(idx, (list, tuple, torch.Tensor)):
+                        # Convert to list if tensor, handle list/tuple
+                        if torch.is_tensor(idx):
+                            idx_list = idx.cpu().tolist()
+                        else:
+                            idx_list = list(idx)
+                        # Scale each index in the list
+                        scaled = [i // stride_t for i in idx_list]
+                    else:
+                        # Single integer
+                        scaled = [idx // stride_t]
                     scaled_label_idx.append(scaled)
 
                 # Only compute Dice/BCE on labeled frames at this scale
@@ -213,6 +226,7 @@ class SegmentationTrainer:
         # Initialize training summary DataFrame
         self.training_summary = []
         
+        self.scaler = GradScaler('cuda', enabled=True)
         # Set up training directory
         if training_dir is None:
             if target_shape is None:
@@ -254,13 +268,15 @@ class SegmentationTrainer:
                 break
             frames = batch['frame'].to(device)
             target = batch['mask'].to(device)
-            label_idx = batch['label_idx'].to(device)
+            label_idx = batch['label_idx']  # List of lists, not a tensor
             optimizer.zero_grad()
-            logits = model(frames)
-            loss = loss_fn(logits, target, label_idx)
+            with autocast(device_type=device, dtype=torch.bfloat16):
+                logits = model(frames)
+                loss = loss_fn(logits, target, label_idx)
             # Single backward on the full weighted loss
-            loss.backward()
-            optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(optimizer)
+            self.scaler.update()
             optimizer.zero_grad()
             total_loss += loss.item()
             with torch.no_grad():
@@ -272,15 +288,22 @@ class SegmentationTrainer:
         return total_loss / len(loader), train_iou / len(loader)
 
     def train_model(self):
+        start_time = time.time()
         best_val_iou = 0.0
         best_train_iou = 0.0
         patience = 0
         for epoch in range(self.n_epochs):
+            epoch_start_time = time.time()
             train_loss, train_iou = self._train_epoch(self.model, self.train_loader, self.optimizer, self.loss_fn, self.device, self.max_batch_per_epoch)
             print(f"Epoch {epoch+1}: Loss={train_loss:.4f}, Train IoU={train_iou:.4f}")
+            epoch_end_time = time.time()
+            print(f"Epoch {epoch+1} took {epoch_end_time - epoch_start_time:.2f} seconds")
             if not self.no_validation:
+                val_start_time = time.time()
                 val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.device, self.create_video, self.max_batch_per_val)
                 print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, \n\tVal IoU (mean)={val_iou:.4f}, \n\tVal IoU (orig, mean)={val_iou_orig:.4f}, \n\tVal IoU (median, Kaggle-style)={median_iou:.4f}, \n\tVal IoU (orig, median)={median_iou_orig:.4f}")
+                val_end_time = time.time()
+                print(f"Validation took {val_end_time - val_start_time:.2f} seconds")
                 # Record training summary
                 self.training_summary.append({
                     'epoch': epoch + 1,
@@ -319,25 +342,28 @@ class SegmentationTrainer:
                     torch.save(self.model.state_dict(), self.best_model_path)
                     print(f"Saved best model to {self.best_model_path}")
                 
-                # Save video if enabled
-                if self.create_video and video_payload is not None:
-                    try:
-                        vgen = VideoGenerator(
-                            video_payload["batch"],
-                            video_payload["pred_masks"],
-                            video_payload["true_masks"],
-                            batch_idx=video_payload["batch_idx"],
-                            output_dir=self.training_dir / 'videos'
-                        )
-                        video_path = vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
-                        print(f"Saved video to {video_path}")
-                    except Exception as e:
-                        print(f"[ERROR][train] video generation failed:\n {e}")
+                    # Save video if enabled
+                    if self.create_video and video_payload is not None:
+                        try:
+                            vgen = VideoGenerator(
+                                video_payload["batch"],
+                                video_payload["pred_masks"],
+                                video_payload["true_masks"],
+                                batch_idx=video_payload["batch_idx"],
+                                output_dir=self.training_dir / 'videos'
+                            )
+                            video_path = vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
+                            print(f"Saved video to {video_path}")
+                        except Exception as e:
+                            print(f"[ERROR][train] video generation failed:\n {e}")
             else:
                 patience += 1
                 if patience >= self.patience:
                     print("Early stopping")
                     break
+            epoch_end_time = time.time()
+            print(f"Epoch {epoch+1} took {epoch_end_time - epoch_start_time:.2f} seconds")
+            print(f"Total time: {time.time() - start_time:.2f} seconds")
         
         # Save training summary CSV at the end
         self._save_training_summary()
@@ -374,7 +400,8 @@ class SegmentationTrainer:
                 frames = batch['frame'].to(device)
                 target = batch['mask'].to(device)
                 label_idx = batch['label_idx']
-                pred = model(frames)  # (B, C, T, H, W)
+                with autocast(device_type=device, dtype=torch.bfloat16):
+                    pred = model(frames)  # (B, C, T, H, W)
                 if self.deep_supervision: #only take the finest prediction for validation
                     pred = pred[0]
                 orig_shape = batch['orig_shape'][0].item(), batch['orig_shape'][1].item()
@@ -416,8 +443,8 @@ class SegmentationTrainer:
                     # Capture first available batch for potential video generation
                     video_payload = {
                         "batch": batch,
-                        "pred_masks": pred.cpu().numpy(),
-                        "true_masks": target.cpu().numpy(),
+                        "pred_masks": pred.cpu().float().numpy(),
+                        "true_masks": target.cpu().float().numpy(),
                         "batch_idx": batch_idx,
                     }
 

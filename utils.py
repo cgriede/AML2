@@ -94,6 +94,7 @@ def dimension_scaler(multiple:int, aspect_ratio_target: float=1.37, base_size: i
 # Short alias
 d = debug
 
+
 def slice_tensor_at_label(pred: torch.Tensor, label_idx: list[int], stride_factor=1) -> torch.Tensor:
     slices = []
     for i in range(pred.shape[0]):
