@@ -1,3 +1,4 @@
+from torch._tensor import Tensor
 from utils import slice_tensor_at_label
 from pathlib import Path
 from datetime import datetime
@@ -79,6 +80,21 @@ class AreaConsistencyLoss(nn.Module):
             return self.weight * diff.mean()
         return 0.0 * areas.sum()  # 0 if batch=1
 
+class OutsideBoxLoss(nn.Module):
+    def __init__(self, weight=1.00):
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, probs: torch.Tensor, box: torch.Tensor):
+        # box: (B, T, H, W) bool
+        outside_mask = ~box
+        
+        # Mean probability outside the box — minimize this
+        outside_probs = probs * outside_mask.float()
+        loss = outside_probs.sum(dim=[2,3,4]) / outside_mask.sum(dim=[-2,-1]).clamp(min=1)
+        
+        return self.weight * loss.mean()
+
 
 class SegmentationTrainer:
 
@@ -89,21 +105,25 @@ class SegmentationTrainer:
                     dice_weight: float = 50,
                     bce_weight: float = 50,
                     tsl_weight: float = 1,
-                    ac_weight: float = 0.5) -> None:
+                    ac_weight: float = 0.5,
+                    box_weight: float = 1.00
+                    ) -> None:
             super().__init__()
             self.dice = BinaryDiceLoss()
             self.bce = nn.BCEWithLogitsLoss()
             self.tsl = TemporalSmoothLoss()
             self.ac = AreaConsistencyLoss()
+            self.box = OutsideBoxLoss()
 
-            total = dice_weight + bce_weight + tsl_weight + ac_weight
+            total = dice_weight + bce_weight + tsl_weight + ac_weight + box_weight
             self.dice_weight = dice_weight / total
             self.bce_weight = bce_weight / total
             self.tsl_weight = tsl_weight / total
             self.ac_weight = ac_weight / total
+            self.box_weight = box_weight / total
 
         @staticmethod
-        def _get_downsampled_pred_target_pairs(target: torch.Tensor, preds: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        def _get_downsampled_pred_pairs(target: torch.Tensor, preds: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
             pred_target_pairs = []
             for i, pred in enumerate(preds):
                 # Downsample target to pred size (nearest to keep binary)
@@ -113,7 +133,7 @@ class SegmentationTrainer:
                 pred_target_pairs.append((pred, target_resized))
             return pred_target_pairs
 
-        def forward(self, logits, target_original, label_idx):
+        def forward(self, logits, target, box, label_idx):
             """
             logits: either single tensor or list of tensors (deep supervision)
             target: full mask sequence (B, 1, T, H, W) or (B, T, H, W)
@@ -121,14 +141,15 @@ class SegmentationTrainer:
             """
             # Handle deep supervision: logits can be list
             if isinstance(logits, list):
-                pred_target_pairs = self._get_downsampled_pred_target_pairs(target_original, logits)
+                pred_target_pairs = self._get_downsampled_pred_pairs(target, logits)
+
             else:
-                pred_target_pairs = [(logits, target_original)]
+                pred_target_pairs = [(logits, target)]
 
             total_loss = 0.0
             weights = [1.0, 0.5, 0.25, 0.125, 0.0625]  # fine to coarse
 
-            for (pred, target), w in zip(pred_target_pairs, weights):
+            for i, (pred, target), w in zip(range(len(pred_target_pairs)), pred_target_pairs, weights):
                 # Compute temporal downsampling factor for this head
                 # pred.shape[2] = current T, target.shape[2] = original T
                 orig_T = target.shape[2]
@@ -168,11 +189,16 @@ class SegmentationTrainer:
                 probs = torch.sigmoid(pred)  # full spatio-temporal volume
                 temp_loss = self.tsl(probs)
                 ac_loss = self.ac(probs)
+                # Only compute box loss on the finest prediction
+                box_loss = torch.tensor(0.0, device=pred.device)
+                if i == 0:
+                    box_loss = self.box(probs, box)
 
                 head_loss = (self.dice_weight * dice_loss +
                             self.bce_weight * bce_loss +
                             self.tsl_weight * temp_loss +
-                            self.ac_weight * ac_loss)
+                            self.ac_weight * ac_loss +
+                            self.box_weight * box_loss)
 
                 total_loss += w * head_loss
 
@@ -269,10 +295,11 @@ class SegmentationTrainer:
             frames = batch['frame'].to(device)
             target = batch['mask'].to(device)
             label_idx = batch['label_idx']  # List of lists, not a tensor
+            box = batch['box'].to(device)
             optimizer.zero_grad()
             with autocast(device_type=device, dtype=torch.bfloat16):
                 logits = model(frames)
-                loss = loss_fn(logits, target, label_idx)
+                loss = loss_fn(logits, target, box, label_idx)
             # Single backward on the full weighted loss
             self.scaler.scale(loss).backward()
             self.scaler.step(optimizer)
@@ -400,6 +427,7 @@ class SegmentationTrainer:
                 frames = batch['frame'].to(device)
                 target = batch['mask'].to(device)
                 label_idx = batch['label_idx']
+                box = batch['box'].to(device)
                 with autocast(device_type=device, dtype=torch.bfloat16):
                     pred = model(frames)  # (B, C, T, H, W)
                 if self.deep_supervision: #only take the finest prediction for validation
@@ -408,7 +436,7 @@ class SegmentationTrainer:
                 orig_mask = batch['orig_mask'].to(device)
                 video_names = batch.get('video_name', [f'batch_{batch_idx}'] * frames.size(0))
 
-                loss = loss_fn(pred, target, label_idx)
+                loss = loss_fn(pred, target,box, label_idx,)
                 total_loss += loss.item()
 
                 pred_probs = torch.sigmoid(slice_tensor_at_label(pred, label_idx))

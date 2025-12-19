@@ -157,6 +157,7 @@ def main_train():
         "rotation_chance": 0.8,
         "upkernel_size": 5,
         "deep_supervision": True,
+        "sequence_length": 16,
     }
     learning_rate = HYPERPARAMETERS["learning_rate"]
     n_epochs_expert = HYPERPARAMETERS["n_epochs_expert"]
@@ -167,6 +168,7 @@ def main_train():
     upkernel_size = HYPERPARAMETERS["upkernel_size"]
     deep_supervision = HYPERPARAMETERS["deep_supervision"]
     upkernel_lr = HYPERPARAMETERS["upkernel_lr"]
+    sequence_length = HYPERPARAMETERS["sequence_length"]
     ############################################################
     print(f"Using target shape: {TARGET_SHAPE}, sequence length {sequence_length}, batch size {batch_size}")
     model_skern = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=3, deep_supervision=deep_supervision).to(DEVICE)
@@ -196,11 +198,13 @@ def main_train():
     shuffle=True,
     num_workers=NUM_WORKERS,
     persistent_workers=True,
+    prefetch_factor=3,
     )
     val_loader_expert = DataLoader(val_ds_expert,
     batch_size=batch_size,
     num_workers=NUM_WORKERS,
     persistent_workers=True,
+    prefetch_factor=2,
     )
     
     train_data_amateur = [item for item in train_data if item.get("dataset") == "amateur"]
@@ -223,11 +227,13 @@ def main_train():
     shuffle=True,
     num_workers=NUM_WORKERS,
     persistent_workers=True,
+    prefetch_factor=3,
     )
     val_loader_amateur = DataLoader(val_ds_amateur,
     batch_size=batch_size,
     num_workers=NUM_WORKERS,
     persistent_workers=True,
+    prefetch_factor=2,
     )
     trainer_amateur = SegmentationTrainer(
     model=model_skern,
@@ -242,7 +248,7 @@ def main_train():
     device=DEVICE,
     deep_supervision=deep_supervision,
     save_threshold_iou=0.25,
-    description=("AMATEUR TRAINING\n" + write_configuration_string(HYPERPARAMETERS))
+    description=("AMATEUR TRAINING with box loss\n" + write_configuration_string(HYPERPARAMETERS))
     )
     trainer_amateur.train_model()
 
@@ -265,7 +271,7 @@ def main_train():
         device=DEVICE,
         deep_supervision=deep_supervision,
         save_threshold_iou=0.4,
-        description=("EXPERT TRAINING\n" + write_configuration_string(HYPERPARAMETERS))
+        description=("EXPERT TRAINING with box loss\n" + write_configuration_string(HYPERPARAMETERS))
     )
     trainer_expert.train_model()
 
