@@ -31,7 +31,10 @@ class BinaryDiceLoss(nn.Module):
         dice = (2 * intersection + self.smooth) / (union + self.smooth)
         
         # Average over batch and channel dimensions to get single scalar loss
-        return 1 - dice.mean()
+        returner =  1 - dice.mean()
+        if torch.isnan(returner).any():
+            returner = torch.tensor(0.0, device=pred_probs.device, dtype=pred_probs.dtype)
+        return returner
 
 class TemporalSmoothLoss(nn.Module):
     """Encourages smooth predictions across consecutive frames using L1 on probabilities"""
@@ -47,7 +50,7 @@ class TemporalSmoothLoss(nn.Module):
 
         #if there is only one frame, return 0
         if pred.shape[2] < 2:
-            return torch.tensor(0.0)
+            returner = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         # Shift pred by one frame along temporal dimension
         pred_t = pred[:, :, :-1, :, :]   # frames 0 to T-2
         pred_t_plus_1 = pred[:, :, 1:, :, :]  # frames 1 to T-1
@@ -57,11 +60,15 @@ class TemporalSmoothLoss(nn.Module):
         
         # Sum/mean over spatial dims, then over temporal pairs and batch
         if self.reduction == 'mean':
-            return diff.mean()
+            returner = diff.mean()
         elif self.reduction == 'sum':
-            return diff.sum()
+            returner = diff.sum()
         else:
             raise ValueError("reduction must be 'mean' or 'sum'")
+
+        if torch.isnan(returner).any():
+            returner = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        return returner
 
 class AreaConsistencyLoss(nn.Module):
     def __init__(self, weight=0.01):
@@ -71,14 +78,14 @@ class AreaConsistencyLoss(nn.Module):
     def forward(self, probs):  # probs = sigmoid(logits), shape (B, 1, T, H, W)
         #if there is only one frame, return 0
         if probs.shape[2] < 2:
-            return torch.tensor(0.0)
+            returner = torch.tensor(0.0, device=probs.device, dtype=probs.dtype)
         # Sum foreground probability mass per frame in batch
         areas = probs.sum(dim=[2,3,4])  # → (B,)
         # Penalize large changes between consecutive frames in batch (approximation)
         if areas.shape[0] > 1:
             diff = torch.abs(areas[1:] - areas[:-1])
             return self.weight * diff.mean()
-        return 0.0 * areas.sum()  # 0 if batch=1
+        return torch.tensor(0.0, device=probs.device, dtype=probs.dtype)
 
 class OutsideBoxLoss(nn.Module):
     def __init__(self, weight=1.00):
@@ -93,7 +100,11 @@ class OutsideBoxLoss(nn.Module):
         outside_probs = probs * outside_mask.float()
         loss = outside_probs.sum(dim=[2,3,4]) / outside_mask.sum(dim=[-2,-1]).clamp(min=1)
         
-        return self.weight * loss.mean()
+        returner =  self.weight * loss.mean()
+
+        if torch.isnan(returner).any():
+            returner = torch.tensor(0.0, device=probs.device, dtype=probs.dtype)
+        return returner
 
 
 class SegmentationTrainer:
@@ -200,10 +211,10 @@ class SegmentationTrainer:
                             self.ac_weight * ac_loss +
                             self.box_weight * box_loss)
 
+                if torch.isnan(head_loss).item():
+                    head_loss = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
                 total_loss += w * head_loss
 
-                if torch.isnan(head_loss).item():
-                    raise ValueError(f"Head loss is NaN for head {w}")
 
             return total_loss
 
@@ -282,6 +293,9 @@ class SegmentationTrainer:
         print(f"Training description saved to {self.training_dir / 'description.txt'}")
         return description
 
+    def get_best_model_path(self):
+        return self.best_model_path
+
     def _train_epoch(self,model, loader, optimizer, loss_fn, device, max_batch_per_epoch: int = 1e3):
         model.train()
         total_loss = 0.0
@@ -297,9 +311,11 @@ class SegmentationTrainer:
             label_idx = batch['label_idx']  # List of lists, not a tensor
             box = batch['box'].to(device)
             optimizer.zero_grad()
-            with autocast(device_type=device, dtype=torch.bfloat16):
+            with autocast(device_type=device, dtype=torch.float16):
                 logits = model(frames)
+                assert torch.isnan(logits[0]).any() == False, "Logits contain NaNs"
                 loss = loss_fn(logits, target, box, label_idx)
+
             # Single backward on the full weighted loss
             self.scaler.scale(loss).backward()
             self.scaler.step(optimizer)
@@ -428,10 +444,11 @@ class SegmentationTrainer:
                 target = batch['mask'].to(device)
                 label_idx = batch['label_idx']
                 box = batch['box'].to(device)
-                with autocast(device_type=device, dtype=torch.bfloat16):
+                with autocast(device_type=device, dtype=torch.float16):
                     pred = model(frames)  # (B, C, T, H, W)
                 if self.deep_supervision: #only take the finest prediction for validation
                     pred = pred[0]
+                assert torch.isnan(pred).any() == False, "Predictions contain NaNs"
                 orig_shape = batch['orig_shape'][0].item(), batch['orig_shape'][1].item()
                 orig_mask = batch['orig_mask'].to(device)
                 video_names = batch.get('video_name', [f'batch_{batch_idx}'] * frames.size(0))

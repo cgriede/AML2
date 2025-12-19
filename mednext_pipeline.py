@@ -46,9 +46,9 @@ MACHINE_CONFIGS = {
         "NUM_CPUS": 16,
         "RAM_GB": 64,
         "DEVICE": "cuda",
-        "MAX_INPUT_SIZE" : (1, 1, 80, 224, 304),
+        "MAX_INPUT_SIZE" : (1, 1, 32, 224, 304),
         #"MAX_INPUT_SIZE" : (1, 1, 16, 320, 432), #works with high res, 8s / sample
-        #"MAX_INPUT_SIZE" : (1, 1, 16, 160, 224),  #high performance, for fast dev
+        #"MAX_INPUT_SIZE" : (1, 1, 16, 64, 80),  #high performance, for fast dev
     },
     "hpc_euler_32" : {
         "NUM_CPUS": 32,
@@ -97,7 +97,6 @@ def setup_machine_config(workspace: str = "home_station"):
     
     return DEVICE, batch_size, sequence_length, TARGET_SHAPE, NUM_WORKERS
 
-
 # ============================================================================
 # MODEL SETUP
 # ============================================================================
@@ -126,11 +125,13 @@ class SegmentationNet(nn.Module):
         # x: (B, C, T, H, W) — e.g., (4, 1, 11, 512, 512) (Batch size, Number of channels, Number of frames, Height, Width)
         #assert x.shape[2] == self.n_frames, f"Expected {self.n_frames} frames, got {x.shape[2]}"
         #assert x.shape[1] == 1, f"Expected 1 channel, got {x.shape[1]}"
+        shapes =  x.shape[-3 : -1]
+        for shape in shapes:
+            if shape % 16 != 0:
+                raise ValueError(f"Expected shape to be divisible by 16, got {shape}")
         output = self.backbone(x)
 
         return output
-
-
 
 def main_train():
     # Setup machine configuration (called here to avoid multiprocessing print issues)
@@ -157,7 +158,7 @@ def main_train():
         "rotation_chance": 0.8,
         "upkernel_size": 5,
         "deep_supervision": True,
-        "sequence_length": 16,
+        "sequence_length": sequence_length,
     }
     learning_rate = HYPERPARAMETERS["learning_rate"]
     n_epochs_expert = HYPERPARAMETERS["n_epochs_expert"]
@@ -286,22 +287,24 @@ def main_train_expert():
     if DEBUG:
         max_batch_per_epoch = 1
         max_batch_per_val = 1
+        NUM_WORKERS = 1
     else:
         max_batch_per_epoch = 1e3
         max_batch_per_val = 1e3
 
     ######HYPERPARAMETERS######################################################
     HYPERPARAMETERS = {
-        "learning_rate": 1e-3,
-        "upkernel_lr": 1e-4,
-        "n_epochs_amateur": 100,
-        "n_epochs_expert": 30,
+        "upkernel_lr": (1e-3, 3e-4, 1e-4),
+        "n_epochs_expert": (30, 30, 40),
+        #"n_epochs_expert": (1, 1, 1),
         "model_id": 'S',
         "random_label_position": True,
         "rotation_chance": 0.8,
-        "upkernel_size": 7,
+        "upkernel_size": (3, 5, 7),
         "deep_supervision": True,
+        "sequence_length": sequence_length,
     }
+    print(f"Using target shape: {TARGET_SHAPE}, sequence length {sequence_length}, batch size {batch_size}")
     n_epochs_expert = HYPERPARAMETERS["n_epochs_expert"]
     model_id = HYPERPARAMETERS["model_id"]
     rotation_chance = HYPERPARAMETERS["rotation_chance"]
@@ -309,60 +312,69 @@ def main_train_expert():
     upkernel_size = HYPERPARAMETERS["upkernel_size"]
     deep_supervision = HYPERPARAMETERS["deep_supervision"]
     upkernel_lr = HYPERPARAMETERS["upkernel_lr"]
+    sequence_length = HYPERPARAMETERS["sequence_length"]
     ############################################################
     #get the pretrained model from the amateur training
-
-    model_skern = SegmentationNet(model_id=model_id, kernel_size=5, deep_supervision=deep_supervision).to(DEVICE)
-    model_upkernel = SegmentationNet(model_id=model_id, kernel_size=upkernel_size, deep_supervision=deep_supervision).to(DEVICE)
-
-    optimizer_upkernel = optim.Adam(model_upkernel.parameters(), lr=upkernel_lr)
     # Load data
     train_data = load_zipped_pickle('train.pkl')
     print(f"Loaded {len(train_data)} training videos\n")
     train_data_expert = [item for item in train_data if item.get("dataset") == "expert"]
-    train_split_ex, val_split_ex = random_split(train_data_expert, [0.85, 0.15])
+    train_split_ex, val_split_ex = random_split(train_data_expert, [0.9, 0.1])
 
     train_ds_expert = MitralValveDataset(train_split_ex, mode="train", target_size=TARGET_SHAPE,
     random_label_position=random_label_position,
     rotation_chance=rotation_chance,
     rotation_angle=20,
-    dataset_type=DatasetType.EXPERT
+    dataset_type=DatasetType.EXPERT,
+    seq_len=sequence_length,
     )
     val_ds_expert = MitralValveDataset(val_split_ex, mode="val", target_size=TARGET_SHAPE)
 
     train_loader_expert = DataLoader(train_ds_expert,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=NUM_WORKERS,
+    num_workers=6,
     persistent_workers=True,
+    prefetch_factor=4,
     )
     val_loader_expert = DataLoader(val_ds_expert,
     batch_size=batch_size,
-    num_workers=NUM_WORKERS,
+    num_workers=2,
     persistent_workers=True,
     )
+    model_3 = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=3, deep_supervision=deep_supervision).to(DEVICE)
+    model_5 = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=5, deep_supervision=deep_supervision).to(DEVICE)
+    model_7 = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=7, deep_supervision=deep_supervision).to(DEVICE)
+    optimizer_3 = optim.Adam(model_3.parameters(), lr=upkernel_lr[0])
+    optimizer_5 = optim.Adam(model_5.parameters(), lr=upkernel_lr[1])
+    optimizer_7 = optim.Adam(model_7.parameters(), lr=upkernel_lr[2])
 
-    model_path = Path(r"D:\ETH\Master\AML\AML2\training\20251218_164719_dim160x224\models\ep018_iouiou04765.pt")
-    model_skern.load_state_dict(torch.load(model_path, map_location=DEVICE))
-    upkern_load_weights(model_upkernel, model_skern)
-
-    # Use the new SegmentationTrainer expert class
-    trainer_expert = SegmentationTrainer(
-        model=model_upkernel,
-        train_loader=train_loader_expert,
-        val_loader=val_loader_expert,
-        optimizer=optimizer_upkernel,
-        n_epochs=n_epochs_expert,
-        create_video=create_video,
-        max_batch_per_epoch=max_batch_per_epoch,
-        max_batch_per_val=max_batch_per_val,
-        target_shape=TARGET_SHAPE,
-        device=DEVICE,
-        deep_supervision=deep_supervision,
-        save_threshold_iou=0.4,
-        description=("EXPERT TRAINING KERNEL 5-> 7\n" + write_configuration_string(HYPERPARAMETERS))
-    )
-    trainer_expert.train_model()
+    models = [model_3, model_5, model_7]
+    optimizers = [optimizer_3, optimizer_5, optimizer_7]
+    for i, (model, optimizer) in enumerate(zip(models, optimizers)):
+        # Use the new SegmentationTrainer expert class
+        trainer_expert = SegmentationTrainer(
+            model=model,
+            train_loader=train_loader_expert,
+            val_loader=val_loader_expert,
+            optimizer=optimizer,
+            n_epochs=n_epochs_expert[i],
+            create_video=create_video,
+            max_batch_per_epoch=max_batch_per_epoch,
+            max_batch_per_val=max_batch_per_val,
+            target_shape=TARGET_SHAPE,
+            device=DEVICE,
+            deep_supervision=deep_supervision,
+            save_threshold_iou=0.4,
+            description=(f"EXPERT TRAINING KERNEL 3-5-7 upsizing current run {i}\n" + write_configuration_string(HYPERPARAMETERS))
+        )
+        trainer_expert.train_model()
+        if i < len(models)-1:
+            #do the upkernel trick on the best model
+            model.load_state_dict(torch.load(trainer_expert.best_model_path, map_location=DEVICE))
+            upkern_load_weights(models[i+1], model)
+        else:
+            main_predict(trainer_expert.best_model_path, expected_iou=0.5, probability_threshold=0.5, path_notes=f"full cycle prediction")
 
 def main_train_finetune_no_val():
         # Setup machine configuration (called here to avoid multiprocessing print issues)
@@ -516,7 +528,7 @@ def main_predict(model_path: Path, expected_iou: float = 0.5, probability_thresh
     return predictions, output_file
 
 if __name__ == '__main__':
-    mode = "train"
+    mode = "train_expert"
     if mode == "train":
         main_train()
     elif mode == "train_expert":
@@ -524,7 +536,7 @@ if __name__ == '__main__':
     elif mode == "train_finetune_no_val":
         main_train_finetune_no_val()
     elif mode == "predict":
-        thresholds = [0.45]
+        thresholds = [0.5]
         for threshold in thresholds:
             print(f"Predicting with probability threshold {threshold}")
             main_predict(
