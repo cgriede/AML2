@@ -337,6 +337,125 @@ def main_train_finetune_no_val(model_path: Path):
     trainer_expert.train_model()
     return trainer_expert.best_model_path_train
 
+def main_train_finetune_amateur(model_path: Path):
+    # Setup machine configuration
+    DEVICE, batch_size, sequence_length, TARGET_SHAPE, NUM_WORKERS = setup_machine_config(workspace="home_station")
+    
+    create_video = False
+    max_batch_per_epoch = 1e3
+
+    ######HYPERPARAMETERS######################################################
+    HYPERPARAMETERS = {
+        "upkernel_lr": 1e-6,
+        "n_epochs": 20,
+        "model_id": 'S',
+        "random_label_position": True,
+        "rotation_chance": 0.5,
+        "upkernel_size": 5,
+        "deep_supervision": True,
+        "sequence_length": sequence_length
+    }
+    n_epochs = HYPERPARAMETERS["n_epochs"]
+    model_id = HYPERPARAMETERS["model_id"]
+    rotation_chance = HYPERPARAMETERS["rotation_chance"]
+    random_label_position = HYPERPARAMETERS["random_label_position"]
+    upkernel_size = HYPERPARAMETERS["upkernel_size"]
+    deep_supervision = HYPERPARAMETERS["deep_supervision"]
+    upkernel_lr = HYPERPARAMETERS["upkernel_lr"]
+    ############################################################
+
+    # Load model
+    print(f"Loading model from {model_path}")
+    model = SegmentationNet(n_frames=sequence_length, model_id='S', kernel_size=upkernel_size, deep_supervision=True).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    
+    optimizer = optim.Adam(model.parameters(), lr=upkernel_lr)
+    
+    # Load Data
+    train_data = load_zipped_pickle('train.pkl')
+    
+    train_data_amateur = [item for item in train_data if item.get("dataset") == "amateur"]
+    print(f"Loaded {len(train_data_amateur)} amateur training videos")
+    
+    train_data_expert = [item for item in train_data if item.get("dataset") == "expert"]
+    # 20% of expert data for validation
+    _, val_data_expert = random_split(train_data_expert, [0.8, 0.2])
+    print(f"Using {len(val_data_expert)} expert videos for validation")
+
+    train_ds_amateur = MitralValveDataset(
+        train_data_amateur, 
+        mode="train", 
+        target_size=None, # Amateur data is 112x112
+        random_label_position=random_label_position,
+        rotation_chance=rotation_chance,
+        rotation_angle=20,
+        dataset_type=DatasetType.AMATEUR,
+        seq_len=sequence_length
+    )
+    
+    train_ds_expert = MitralValveDataset(
+        [item for item in train_data_expert if item not in val_data_expert], 
+        mode="train", 
+        target_size=TARGET_SHAPE,
+        random_label_position=random_label_position,
+        rotation_chance=rotation_chance,
+        rotation_angle=20,
+        dataset_type=DatasetType.EXPERT,
+        seq_len=sequence_length
+    )
+
+    # Create dynamic dataset with 30% amateur data
+    # Calculate roughly how many amateur samples per batch to get ~30%
+    # If batch size is e.g. 16, 30% is ~5
+    num_amateur_per_epoch = int(0.3 * batch_size) # This is amateur per batch actually if used in collate, but DynamicAmateurMixDataset uses it per batch
+    if num_amateur_per_epoch < 1: num_amateur_per_epoch = 1
+
+    dynamic_dataset = DynamicAmateurMixDataset(
+        expert_dataset=train_ds_expert,
+        amateur_dataset=train_ds_amateur,
+        num_amateur_per_epoch=num_amateur_per_epoch, 
+        seed=42
+    )
+
+    train_loader = DataLoader(
+        dynamic_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=6,
+        persistent_workers=True,
+    )
+
+    val_ds_expert = MitralValveDataset(val_data_expert, mode="val", target_size=TARGET_SHAPE)
+    val_loader = DataLoader(
+        val_ds_expert,
+        batch_size=batch_size,
+        num_workers=NUM_WORKERS,
+        persistent_workers=True,
+    )
+
+    trainer = SegmentationTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        n_epochs=n_epochs,
+        create_video=create_video,
+        max_batch_per_epoch=max_batch_per_epoch,
+        max_batch_per_val=1e3,
+        target_shape=TARGET_SHAPE,
+        device=DEVICE,
+        deep_supervision=True,
+        save_threshold_iou=0.5,
+        no_validation=False,
+        description=("AMATEUR MIXED FINETUNE (Kernel 5) on Best Mixed Model\n" + write_configuration_string(HYPERPARAMETERS))
+    )
+    trainer.train_model()
+    
+    main_predict_5(trainer.best_model_path_val, expected_iou=0.5, probability_threshold=0.5, path_notes=f"finetune_mixed_val_ep20_k5")
+    main_predict_5(trainer.best_model_path_mixed, expected_iou=0.5, probability_threshold=0.5, path_notes=f"finetune_mixed_mixed_ep20_k5")
+    
+    return trainer.best_model_path_val if trainer.best_model_path_val else trainer.best_model_path_train
+
 def main_predict(model_path: Path, expected_iou: float = 0.5, probability_threshold: float = 0.5, path_notes: str = ""):
     """
     Generate predictions for test set and save submission file.
@@ -393,10 +512,6 @@ def main_predict(model_path: Path, expected_iou: float = 0.5, probability_thresh
         expected_iou=expected_iou,
         path_notes=path_notes
     )
-
-    cmd = f'kaggle competitions submit -c eth-aml-2025-project-task-2 -f {output_file} -m "{path_notes + " " + str(expected_iou)}"'
-    os.system(cmd)
-    print(f"Submission sent to Kaggle")
     generate_videos = True
     if generate_videos:
         # Generate visualization videos
@@ -412,6 +527,79 @@ def main_predict(model_path: Path, expected_iou: float = 0.5, probability_thresh
     print(f"Videos saved to {output_dir / 'videos'}")
     return predictions, output_file
 
+
+def main_predict_5(model_path: Path, expected_iou: float = 0.5, probability_threshold: float = 0.5, path_notes: str = ""):
+    """
+    Generate predictions for test set and save submission file.
+    
+    Args:
+        model_path: Path to the trained model checkpoint
+        expected_iou: Expected IoU for directory naming (e.g., 0.5430)
+    """
+    # Setup machine configuration
+    DEVICE, batch_size, sequence_length, TARGET_SHAPE, NUM_WORKERS = setup_machine_config(workspace="home_station")
+    
+    # Load model
+    model = SegmentationNet(n_frames=sequence_length, model_id='S', kernel_size=5, deep_supervision=True).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+    print(f"Loaded model from {model_path}")
+    
+    # Load test data
+    test_data = load_zipped_pickle('test.pkl')
+    #test_data = test_data[:1] #for debug
+    print(f"Loaded {len(test_data)} test videos")
+    
+    # Create test dataset and loader
+    # Note: For test data, we need to predict ALL frames, not just labeled ones
+    test_ds = MitralValveDataset(test_data, mode="test", seq_len=sequence_length, target_size=TARGET_SHAPE)
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        num_workers=5,
+        persistent_workers=True if NUM_WORKERS > 0 else False,
+        shuffle=False
+    )
+    print(f"Test dataset: {len(test_ds)} sequences")
+    
+    # Generate predictions
+    print("Generating predictions...")
+    predictor = SegmentationPredictor(
+        model=model,
+        loader=test_loader,
+        device=DEVICE,
+        seq_len=sequence_length,
+        num_postprocess_workers=2,
+        test_data=test_data,
+        deep_supervision=True,
+        probability_threshold=probability_threshold
+    )
+    predictions = predictor.predict_test()
+    
+    # Save submission file
+    print("Saving submission file...")
+    output_file, output_dir = SegmentationPredictor.save_submission(
+        predictions=predictions,
+        test_data=test_data,
+        expected_iou=expected_iou,
+        path_notes=path_notes
+    )
+
+    
+    generate_videos = True
+    if generate_videos:
+        # Generate visualization videos
+        print("Generating visualization videos...")
+        SegmentationPredictor.generate_full_videos(
+            predictions=predictions,
+            test_data=test_data,
+            output_dir=output_dir,
+            max_videos=20
+        )
+        
+    print(f"Prediction complete! Submission saved to {output_file}")
+    print(f"Videos saved to {output_dir / 'videos'}")
+    return predictions, output_file
 
 def release_to_kaggle(csv_file: Path, message: str = ""):
     import sys
@@ -449,20 +637,36 @@ def release_to_kaggle(csv_file: Path, message: str = ""):
 
 
 if __name__ == '__main__':
-    mode = "train_expert"
+    mode = "predict"
     if mode == "train_expert":
         main_train_expert()
     elif mode == "train_finetune_no_val":
         main_train_finetune_no_val()
+    elif mode == "train_finetune_amateur":
+        path = Path(r"D:\ETH\Master\AML\AML2\training\20251223_095952_dim240x320\models\ep030_val_iouiou04984.pt")
+        best_model_path = main_train_finetune_amateur(path)
+        
+        # Determine appropriate note and expected IOU based on which model was selected
+        if "val" in str(best_model_path):
+            note = "finetune_amateur_val_best"
+        else:
+            note = "finetune_amateur_train_best"
+            
+        # Predict with the new model
+        main_predict_5(
+             model_path=best_model_path,
+             expected_iou=0.4984, 
+             probability_threshold=0.5,
+             path_notes=f"finetune_mixed_ep20_k5"
+         )
     elif mode == "predict":
-        thresholds = [0.5]
-        for threshold in thresholds:
-            print(f"Predicting with probability threshold {threshold}")
-            main_predict(
-                model_path=Path(r'D:\ETH\Master\AML\AML2\training\20251218_193011_dim160x224\models\ep086_iouiou06163.pt'),
-                expected_iou=0.6163,
-                probability_threshold=threshold,
-                path_notes=f"threshold_045"
-            )
+        hail_mary_path = Path(r'D:\ETH\Master\AML\AML2\training\20251223_134207_dim240x320\models\ep004_train_iouiou06558.pt')
+        main_predict_5(
+            model_path=Path(r'training\20251223_134207_dim240x320\models\ep005_val_iouiou06737.pt'),
+            expected_iou=0.7,
+            probability_threshold=0.5,
+            path_notes=f"hail_mary"
+        )
+
     elif mode == "release_to_kaggle":
         release_to_kaggle(csv_file=Path(r'D:\ETH\Master\AML\AML2\results\20251218_05430\submission.csv'), message="automatic release test")

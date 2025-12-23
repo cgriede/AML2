@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import csv
 from multiprocessing import Pool
-from tqdm import tqdm
 
 def _postprocess_video(video_data):
     """
@@ -99,9 +98,14 @@ class SegmentationPredictor:
         """
         self.model.eval()
         predictions = {}  # {video_name: np.array (H_orig, W_orig, T)}
-
+        batch_idx = 0
+        disp_int = len(self.loader)/10
+        disp_int = int(disp_int)
         with torch.no_grad():
-            for batch in tqdm(self.loader, desc="Predicting test"):
+            for batch in self.loader:
+                batch_idx += 1
+                if batch_idx % disp_int == 0:
+                    print(f"Predicting batch {batch_idx} of {len(self.loader)} ({batch_idx/len(self.loader)*100:.2f}%)")
                 frames = batch['frame'].to(self.device)           # (B, C, T, H, W)
                 names = batch['name']                             # list of str
                 frame_indices = batch['frame_idx'].cpu().numpy() # global frame idx in video
@@ -141,9 +145,6 @@ class SegmentationPredictor:
                     # Place prediction at correct global frame
                     predictions[name][:, :, global_frame_idx] = (prob > self.probability_threshold)
 
-                    center_in_seq = label_indices[i]  # or however you get center
-                    print(f"Video {name}: placing prediction at global frame {global_frame_idx}")
-                    print(f"  (center in sequence: {center_in_seq}, sequence length: {frames.shape[2]})")
 
         return predictions
         
