@@ -9,6 +9,25 @@ import numpy as np
 import time
 from video_generator import VideoGenerator
 from torch.amp import GradScaler, autocast
+import json
+import os
+
+def log_debug(message, data=None, location="", hypothesis_id="generic"):
+    payload = {
+        "sessionId": "debug-session",
+        "runId": "run1",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data if data else {},
+        "timestamp": int(time.time() * 1000)
+    }
+    try:
+        with open(r"d:\ETH\Master\AML\AML2\.cursor\debug.log", "a") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception as e:
+        pass # Fallback or ignore
+
 
 # ============================================================================
 # LOSS FUNCTIONS
@@ -106,6 +125,12 @@ class OutsideBoxLoss(nn.Module):
             returner = torch.tensor(0.0, device=probs.device, dtype=probs.dtype)
         return returner
 
+class ZeroLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, *args):
+        return torch.tensor(0.0, device=args[0].device, dtype=args[0].dtype)
 
 class SegmentationTrainer:
 
@@ -117,7 +142,7 @@ class SegmentationTrainer:
                     bce_weight: float = 50,
                     tsl_weight: float = 1,
                     ac_weight: float = 0.5,
-                    box_weight: float = 1.00
+                    box_weight: float = 0.2,
                     ) -> None:
             super().__init__()
             self.dice = BinaryDiceLoss()
@@ -132,6 +157,23 @@ class SegmentationTrainer:
             self.tsl_weight = tsl_weight / total
             self.ac_weight = ac_weight / total
             self.box_weight = box_weight / total
+
+            zero_threshold = 1e-8
+            if self.dice_weight < zero_threshold:
+                self.dice = ZeroLoss()
+                print("Dice weight is less than zero threshold, setting to zero loss")
+            if self.bce_weight < zero_threshold:
+                self.bce = ZeroLoss()
+                print("BCE weight is less than zero threshold, setting to zero loss")
+            if self.tsl_weight < zero_threshold:
+                self.tsl = ZeroLoss()
+                print("Temporal smoothness weight is less than zero threshold, setting to zero loss")
+            if self.ac_weight < zero_threshold:
+                self.ac = ZeroLoss()
+                print("Area consistency weight is less than zero threshold, setting to zero loss")
+            if self.box_weight < zero_threshold:
+                self.box = ZeroLoss()
+                print("Box loss is less than zero threshold, setting to zero loss")
 
         @staticmethod
         def _get_downsampled_pred_pairs(target: torch.Tensor, preds: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -231,7 +273,7 @@ class SegmentationTrainer:
 
 
     def __init__(self, model, train_loader, val_loader, optimizer, n_epochs: int,
-                loss_fn: nn.Module = CombinedLoss(),
+                loss_fn: nn.Module = None,
                 create_video: bool=True,
                 max_batch_per_epoch: int = 1e3,
                 max_batch_per_val:int = 1e3,
@@ -248,7 +290,16 @@ class SegmentationTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.optimizer = optimizer
-        self.loss_fn = loss_fn
+        if loss_fn is None:
+            self.loss_fn = SegmentationTrainer.CombinedLoss(
+                dice_weight=1,
+                bce_weight=0,
+                tsl_weight=0,
+                ac_weight=0,
+                box_weight=0,
+            )
+        else:
+            self.loss_fn = loss_fn
         self.n_epochs = n_epochs
         self.create_video = create_video
         self.max_batch_per_epoch = max_batch_per_epoch
@@ -258,7 +309,9 @@ class SegmentationTrainer:
         self.device = device
         self.deep_supervision = deep_supervision
         self.description = description
-        self.best_model_path = None
+        self.best_model_path_mixed = None
+        self.best_model_path_train = None
+        self.best_model_path_val = None
         self.no_validation = no_validation
         # Initialize training summary DataFrame
         self.training_summary = []
@@ -295,8 +348,11 @@ class SegmentationTrainer:
 
     def get_best_model_path(self):
         return self.best_model_path
-
-    def _train_epoch(self,model, loader, optimizer, loss_fn, device, max_batch_per_epoch: int = 1e3):
+    def on_epoch_end(self):
+        # If dataset has on_epoch_end method, call it
+        if hasattr(self.train_loader.dataset, 'on_epoch_end'):
+            self.train_loader.dataset.on_epoch_end()
+    def _train_epoch(self,model, loader, optimizer, device, max_batch_per_epoch: int = 1e3):
         model.train()
         total_loss = 0.0
         batches_per_epoch = 0
@@ -313,8 +369,27 @@ class SegmentationTrainer:
             optimizer.zero_grad()
             with autocast(device_type=device, dtype=torch.float16):
                 logits = model(frames)
+                if not torch.isnan(logits[0]).any() == False:
+                    # #region agent log
+                    log_debug("NaN detected in logits[0]", 
+                              {"logits_nan": True, "batch_idx": batch_idx,
+                               "logits_0_shape": str(logits[0].shape)}, 
+                              "trainer.py:317", "nan_detection")
+                    
+                    # Check model weights for NaNs
+                    has_nan_weights = False
+                    for name, param in model.named_parameters():
+                        if torch.isnan(param).any():
+                            has_nan_weights = True
+                            log_debug(f"NaN found in weights: {name}", {}, "trainer.py:317", "weight_check")
+                            break
+                    
+                    log_debug("Model weights check complete", {"has_nan_weights": has_nan_weights}, "trainer.py:317", "weight_check")
+                    # #endregion
+                    logits = model(frames)
                 assert torch.isnan(logits[0]).any() == False, "Logits contain NaNs"
-                loss = loss_fn(logits, target, box, label_idx)
+
+                loss = self.loss_fn(logits, target, box, label_idx)
 
             # Single backward on the full weighted loss
             self.scaler.scale(loss).backward()
@@ -334,16 +409,17 @@ class SegmentationTrainer:
         start_time = time.time()
         best_val_iou = 0.0
         best_train_iou = 0.0
+        best_mixed_iou = 0.0
         patience = 0
         for epoch in range(self.n_epochs):
             epoch_start_time = time.time()
-            train_loss, train_iou = self._train_epoch(self.model, self.train_loader, self.optimizer, self.loss_fn, self.device, self.max_batch_per_epoch)
+            train_loss, train_iou = self._train_epoch(self.model, self.train_loader, self.optimizer, self.device, self.max_batch_per_epoch)
             print(f"Epoch {epoch+1}: Loss={train_loss:.4f}, Train IoU={train_iou:.4f}")
             epoch_end_time = time.time()
             print(f"Epoch {epoch+1} took {epoch_end_time - epoch_start_time:.2f} seconds")
             if not self.no_validation:
                 val_start_time = time.time()
-                val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.loss_fn, self.device, self.create_video, self.max_batch_per_val)
+                val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = self._validate(self.model, self.val_loader, self.device, self.create_video, self.max_batch_per_val)
                 print(f"Epoch {epoch+1}: Val Loss={val_loss:.4f}, \n\tVal IoU (mean)={val_iou:.4f}, \n\tVal IoU (orig, mean)={val_iou_orig:.4f}, \n\tVal IoU (median, Kaggle-style)={median_iou:.4f}, \n\tVal IoU (orig, median)={median_iou_orig:.4f}")
                 val_end_time = time.time()
                 print(f"Validation took {val_end_time - val_start_time:.2f} seconds")
@@ -366,53 +442,62 @@ class SegmentationTrainer:
                     'train_iou': train_iou,
                 })
                 val_loss, val_iou, val_iou_orig, median_iou, median_iou_orig, video_payload = 0, 0, 0, 0, 0, None
-            
-            if val_iou > best_val_iou or train_iou > best_train_iou:
-                if self.no_validation:
-                    best_train_iou = train_iou
-                else:
-                    best_val_iou = val_iou
+            mixed_iou = (train_iou + val_iou) / 2
+            print(f"        Mixed IoU: {mixed_iou:.4f}")
+            if mixed_iou > best_mixed_iou:
+                best_mixed_iou = mixed_iou
                 patience = 0
-                # Delete previous best model if exists
-                if self.best_model_path is not None and self.best_model_path.exists():
-                    self.best_model_path.unlink(missing_ok=True)
-                
-                if max(best_val_iou, best_train_iou) > self.save_threshold_iou:
-                    # Save new best model to training_dir/models
-                    iou_string = f'iou{max(best_val_iou, best_train_iou):.4f}'.replace('.', '')
-                    model_filename = f'ep{epoch+1:03d}_iou{iou_string}.pt'
-                    self.best_model_path = self.training_dir / 'models' / model_filename
-                    torch.save(self.model.state_dict(), self.best_model_path)
-                    print(f"Saved best model to {self.best_model_path}")
-                
-                    # Save video if enabled
-                    if self.create_video and video_payload is not None:
-                        try:
-                            vgen = VideoGenerator(
-                                video_payload["batch"],
-                                video_payload["pred_masks"],
-                                video_payload["true_masks"],
-                                batch_idx=video_payload["batch_idx"],
-                                output_dir=self.training_dir / 'videos'
-                            )
-                            video_path = vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
-                            print(f"Saved video to {video_path}")
-                        except Exception as e:
-                            print(f"[ERROR][train] video generation failed:\n {e}")
+                self.best_model_path_mixed = self.save_best_model(best_mixed_iou, self.best_model_path_mixed, epoch, "mixed", video_payload)
+            if train_iou > best_train_iou:
+                best_train_iou = train_iou
+                patience = 0
+                self.best_model_path_train = self.save_best_model(best_train_iou, self.best_model_path_train, epoch, "train", video_payload)
+            if val_iou > best_val_iou:
+                best_val_iou = val_iou
+                patience = 0
+                self.best_model_path_val = self.save_best_model(best_val_iou, self.best_model_path_val, epoch, "val", video_payload)
             else:
                 patience += 1
                 if patience >= self.patience:
                     print("Early stopping")
                     break
             epoch_end_time = time.time()
+            self.on_epoch_end()
             print(f"Epoch {epoch+1} took {epoch_end_time - epoch_start_time:.2f} seconds")
             print(f"Total time: {time.time() - start_time:.2f} seconds")
-        
         # Save training summary CSV at the end
         self._save_training_summary()
         
         return self
     
+    def save_best_model(self, best_iou: float, best_model_path: Path, epoch:int, mode:str, video_payload: dict = None):
+        if best_iou > self.save_threshold_iou:
+            # Delete previous best model if exists
+            if best_model_path is not None and best_model_path.exists():
+                best_model_path.unlink(missing_ok=True)
+            # Save new best model to training_dir/models
+            iou_string = f'iou{best_iou:.4f}'.replace('.', '')
+            model_filename = f'ep{epoch+1:03d}_{mode}_iou{iou_string}.pt'
+            best_model_path = self.training_dir / 'models' / model_filename
+            torch.save(self.model.state_dict(), best_model_path)
+            print(f"Saved best model to {best_model_path}")
+        
+            # Save video if enabled
+            if self.create_video and video_payload is not None:
+                try:
+                    vgen = VideoGenerator(
+                        video_payload["batch"],
+                        video_payload["pred_masks"],
+                        video_payload["true_masks"],
+                        batch_idx=video_payload["batch_idx"],
+                        output_dir=self.training_dir / 'videos'
+                    )
+                    video_path = vgen.save_sequence_gif(fps=10, alpha=0.5, frame_skip=1)
+                    print(f"Saved video to {video_path}")
+                except Exception as e:
+                    print(f"[ERROR][train] video generation failed:\n {e}")
+        return best_model_path
+
     def _save_training_summary(self):
         """Save training summary to CSV file"""
         if len(self.training_summary) > 0:
@@ -423,7 +508,7 @@ class SegmentationTrainer:
         else:
             print("Warning: No training summary to save")
 
-    def _validate(self, model, loader, loss_fn, device, create_video: bool=True, max_batch_per_val:int = 1e3):
+    def _validate(self, model, loader, device, create_video: bool=True, max_batch_per_val:int = 1e3):
         model.eval()
         total_loss = 0.0
         total_iou = 0.0
@@ -453,7 +538,7 @@ class SegmentationTrainer:
                 orig_mask = batch['orig_mask'].to(device)
                 video_names = batch.get('video_name', [f'batch_{batch_idx}'] * frames.size(0))
 
-                loss = loss_fn(pred, target,box, label_idx,)
+                loss = self.loss_fn(pred, target,box, label_idx,)
                 total_loss += loss.item()
 
                 pred_probs = torch.sigmoid(slice_tensor_at_label(pred, label_idx))

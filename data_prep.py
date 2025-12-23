@@ -6,11 +6,10 @@ import numpy as np
 import torch
 import gzip
 import pickle
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset
 from scipy import ndimage
 from enum import Enum
 import random
-
 
 def load_zipped_pickle(filename):
     """Load a pickle file, handling both plain .pkl and gzipped .pkl.gz"""
@@ -267,3 +266,42 @@ class MitralValveDataset(Dataset):
                 result['orig_box'] = torch.from_numpy(np.expand_dims(box, axis=0))  # (1, H, W)
         
         return result
+
+
+
+class DynamicAmateurMixDataset(Dataset):
+    def __init__(self, expert_dataset, amateur_dataset, num_amateur_per_epoch=5, seed=None):
+        """
+        expert_dataset: your fixed train_ds_expert (MitralValveDataset object)
+        amateur_dataset: MitralValveDataset object with all 64 amateur videos
+        num_amateur_per_epoch: how many amateur videos to randomly pick each epoch
+        """
+        self.expert_dataset = expert_dataset
+        self.amateur_dataset = amateur_dataset
+        self.num_amateur_per_epoch = num_amateur_per_epoch
+        self.rng = random.Random(seed)  # for reproducibility
+
+        # Prepare indices for all amateur videos in the dataset
+        self.amateur_video_indices = list(range(len(amateur_dataset)))
+        self._refresh_amateur_subset()
+    
+    def _refresh_amateur_subset(self):
+        # Randomly pick N indices for the amateur dataset
+        selected_indices = self.rng.sample(self.amateur_video_indices, self.num_amateur_per_epoch)
+        
+        # Create a subset of the amateur dataset
+        from torch.utils.data import Subset
+        self.current_amateur_dataset = Subset(self.amateur_dataset, selected_indices)
+
+        # Combine with fixed expert
+        self.combined_dataset = ConcatDataset([self.expert_dataset, self.current_amateur_dataset])
+    
+    def __getitem__(self, idx):
+        return self.combined_dataset[idx]
+    
+    def __len__(self):
+        return len(self.combined_dataset)
+    
+    def on_epoch_end(self):
+        """Call this at the end of each epoch to reshuffle amateur videos"""
+        self._refresh_amateur_subset()

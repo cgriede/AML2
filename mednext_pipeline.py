@@ -17,7 +17,7 @@ from pathlib import Path
 from utils import write_configuration_string
 
 from mednext import create_mednext_v1, upkern_load_weights
-from data_prep import load_zipped_pickle, MitralValveDataset, DatasetType   
+from data_prep import load_zipped_pickle, MitralValveDataset, DatasetType, DynamicAmateurMixDataset
 from trainer import SegmentationTrainer
 from predictor import SegmentationPredictor
 
@@ -46,7 +46,7 @@ MACHINE_CONFIGS = {
         "NUM_CPUS": 16,
         "RAM_GB": 64,
         "DEVICE": "cuda",
-        "MAX_INPUT_SIZE" : (1, 1, 32, 224, 304),
+        "MAX_INPUT_SIZE" : (1, 1, 32, 240, 320),
         #"MAX_INPUT_SIZE" : (1, 1, 16, 320, 432), #works with high res, 8s / sample
         #"MAX_INPUT_SIZE" : (1, 1, 16, 64, 80),  #high performance, for fast dev
     },
@@ -133,148 +133,6 @@ class SegmentationNet(nn.Module):
 
         return output
 
-def main_train():
-    # Setup machine configuration (called here to avoid multiprocessing print issues)
-    DEVICE, batch_size, sequence_length, TARGET_SHAPE, NUM_WORKERS = setup_machine_config(workspace="home_station")
-    
-    DEBUG = False
-    create_video = True
-
-    if DEBUG:
-        max_batch_per_epoch = 1
-        max_batch_per_val = 1
-    else:
-        max_batch_per_epoch = 1e3
-        max_batch_per_val = 1e3
-
-    ######HYPERPARAMETERS######################################################
-    HYPERPARAMETERS = {
-        "learning_rate": 1e-3,
-        "upkernel_lr": 3e-4,
-        "n_epochs_amateur": 50,
-        "n_epochs_expert": 30,
-        "model_id": 'S',
-        "random_label_position": True,
-        "rotation_chance": 0.8,
-        "upkernel_size": 5,
-        "deep_supervision": True,
-        "sequence_length": sequence_length,
-    }
-    learning_rate = HYPERPARAMETERS["learning_rate"]
-    n_epochs_expert = HYPERPARAMETERS["n_epochs_expert"]
-    n_epochs_amateur = HYPERPARAMETERS["n_epochs_amateur"]
-    model_id = HYPERPARAMETERS["model_id"]
-    rotation_chance = HYPERPARAMETERS["rotation_chance"]
-    random_label_position = HYPERPARAMETERS["random_label_position"]
-    upkernel_size = HYPERPARAMETERS["upkernel_size"]
-    deep_supervision = HYPERPARAMETERS["deep_supervision"]
-    upkernel_lr = HYPERPARAMETERS["upkernel_lr"]
-    sequence_length = HYPERPARAMETERS["sequence_length"]
-    ############################################################
-    print(f"Using target shape: {TARGET_SHAPE}, sequence length {sequence_length}, batch size {batch_size}")
-    model_skern = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=3, deep_supervision=deep_supervision).to(DEVICE)
-    model_upkernel = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=upkernel_size, deep_supervision=deep_supervision).to(DEVICE)
-
-    optimizer = optim.Adam(model_skern.parameters(), lr=learning_rate)
-    optimizer_upkernel = optim.Adam(model_upkernel.parameters(), lr=upkernel_lr)
-    # Load data
-    train_data = load_zipped_pickle('train.pkl')
-    print(f"Loaded {len(train_data)} training videos\n")
-    train_data_expert = [item for item in train_data if item.get("dataset") == "expert"]
-    train_split_ex, val_split_ex = random_split(train_data_expert, [0.8, 0.2])
-
-    train_ds_expert = MitralValveDataset(train_split_ex, mode="train", target_size=TARGET_SHAPE,
-    random_label_position=random_label_position,
-    rotation_chance=rotation_chance,
-    rotation_angle=20,
-    dataset_type=DatasetType.EXPERT,
-    seq_len=sequence_length,
-    )
-    val_ds_expert = MitralValveDataset(val_split_ex, mode="val", target_size=TARGET_SHAPE,
-    seq_len=sequence_length
-    )
-
-    train_loader_expert = DataLoader(train_ds_expert,
-    batch_size=batch_size,
-    shuffle=True,
-    num_workers=NUM_WORKERS,
-    persistent_workers=True,
-    prefetch_factor=3,
-    )
-    val_loader_expert = DataLoader(val_ds_expert,
-    batch_size=batch_size,
-    num_workers=NUM_WORKERS,
-    persistent_workers=True,
-    prefetch_factor=2,
-    )
-    
-    train_data_amateur = [item for item in train_data if item.get("dataset") == "amateur"]
-    train_ds_amateur = MitralValveDataset(train_data_amateur, mode="train", target_size=None, #no rescaling since 112x112 shape
-    random_label_position=random_label_position,
-    rotation_chance=rotation_chance,
-    rotation_angle=20,
-    dataset_type=DatasetType.AMATEUR,
-    seq_len=sequence_length,
-    )
-    #use 30% of the expert data for validation
-    val_data_amateur, _ = random_split(train_data_expert, [0.3, 0.7])
-    val_ds_amateur = MitralValveDataset(val_data_amateur, mode="val", target_size=TARGET_SHAPE,
-    dataset_type=DatasetType.EXPERT,
-    seq_len=sequence_length
-    )
-
-    train_loader_amateur = DataLoader(train_ds_amateur,
-    batch_size=batch_size,
-    shuffle=True,
-    num_workers=NUM_WORKERS,
-    persistent_workers=True,
-    prefetch_factor=3,
-    )
-    val_loader_amateur = DataLoader(val_ds_amateur,
-    batch_size=batch_size,
-    num_workers=NUM_WORKERS,
-    persistent_workers=True,
-    prefetch_factor=2,
-    )
-    trainer_amateur = SegmentationTrainer(
-    model=model_skern,
-    train_loader=train_loader_amateur,
-    val_loader=val_loader_amateur,
-    optimizer=optimizer,
-    n_epochs=n_epochs_amateur,
-    create_video=create_video,
-    max_batch_per_epoch=max_batch_per_epoch,
-    max_batch_per_val=max_batch_per_val,
-    target_shape=TARGET_SHAPE,
-    device=DEVICE,
-    deep_supervision=deep_supervision,
-    save_threshold_iou=0.25,
-    description=("AMATEUR TRAINING with box loss\n" + write_configuration_string(HYPERPARAMETERS))
-    )
-    trainer_amateur.train_model()
-
-    #get the pretrained model from the amateur training
-    best_model_path = trainer_amateur.best_model_path
-    model_skern.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
-    upkern_load_weights(model_upkernel, model_skern)
-
-    # Use the new SegmentationTrainer expert class
-    trainer_expert = SegmentationTrainer(
-        model=model_upkernel,
-        train_loader=train_loader_expert,
-        val_loader=val_loader_expert,
-        optimizer=optimizer_upkernel,
-        n_epochs=n_epochs_expert,
-        create_video=create_video,
-        max_batch_per_epoch=max_batch_per_epoch,
-        max_batch_per_val=max_batch_per_val,
-        target_shape=TARGET_SHAPE,
-        device=DEVICE,
-        deep_supervision=deep_supervision,
-        save_threshold_iou=0.4,
-        description=("EXPERT TRAINING with box loss\n" + write_configuration_string(HYPERPARAMETERS))
-    )
-    trainer_expert.train_model()
 
 def main_train_expert():
 
@@ -294,12 +152,11 @@ def main_train_expert():
 
     ######HYPERPARAMETERS######################################################
     HYPERPARAMETERS = {
-        "upkernel_lr": (1e-3, 3e-4, 1e-4),
-        "n_epochs_expert": (30, 30, 40),
-        #"n_epochs_expert": (1, 1, 1),
+        "upkernel_lr": (5e-4, 2e-4, 7e-5),
+        "n_epochs_expert": (40, 40, 50),
         "model_id": 'S',
         "random_label_position": True,
-        "rotation_chance": 0.8,
+        "rotation_chance": 0.2,
         "upkernel_size": (3, 5, 7),
         "deep_supervision": True,
         "sequence_length": sequence_length,
@@ -309,7 +166,6 @@ def main_train_expert():
     model_id = HYPERPARAMETERS["model_id"]
     rotation_chance = HYPERPARAMETERS["rotation_chance"]
     random_label_position = HYPERPARAMETERS["random_label_position"]
-    upkernel_size = HYPERPARAMETERS["upkernel_size"]
     deep_supervision = HYPERPARAMETERS["deep_supervision"]
     upkernel_lr = HYPERPARAMETERS["upkernel_lr"]
     sequence_length = HYPERPARAMETERS["sequence_length"]
@@ -335,13 +191,40 @@ def main_train_expert():
     shuffle=True,
     num_workers=6,
     persistent_workers=True,
-    prefetch_factor=4,
+    prefetch_factor=5,
     )
     val_loader_expert = DataLoader(val_ds_expert,
     batch_size=batch_size,
     num_workers=2,
     persistent_workers=True,
     )
+
+    train_data_amateur = [item for item in train_data if item.get("dataset") == "amateur"]
+    train_ds_amateur = MitralValveDataset(train_data_amateur, mode="train", target_size=None, #no rescaling since 112x112 shape
+    random_label_position=random_label_position,
+    rotation_chance=rotation_chance,
+    rotation_angle=20,
+    dataset_type=DatasetType.AMATEUR,
+    seq_len=sequence_length,
+    )
+
+    # Create dynamic dataset
+    dynamic_dataset = DynamicAmateurMixDataset(
+        expert_dataset=train_ds_expert,
+        amateur_dataset=train_ds_amateur,
+        num_amateur_per_epoch=5,   # your target
+        seed=42  # for reproducibility
+    )
+
+    mixed_loader = DataLoader(
+        dynamic_dataset,
+        batch_size=batch_size,
+        shuffle=True,                  # shuffles within current subset
+        num_workers=6,
+        persistent_workers=True,
+        prefetch_factor=5,
+    )
+
     model_3 = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=3, deep_supervision=deep_supervision).to(DEVICE)
     model_5 = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=5, deep_supervision=deep_supervision).to(DEVICE)
     model_7 = SegmentationNet(n_frames=sequence_length, model_id=model_id, kernel_size=7, deep_supervision=deep_supervision).to(DEVICE)
@@ -351,14 +234,15 @@ def main_train_expert():
 
     models = [model_3, model_5, model_7]
     optimizers = [optimizer_3, optimizer_5, optimizer_7]
-    for i, (model, optimizer) in enumerate(zip(models, optimizers)):
+    train_loaders = [mixed_loader, train_loader_expert, train_loader_expert]
+    for i, (model, optimizer, train_loader, n_epochs) in enumerate(zip(models, optimizers, train_loaders, n_epochs_expert)):
         # Use the new SegmentationTrainer expert class
         trainer_expert = SegmentationTrainer(
             model=model,
-            train_loader=train_loader_expert,
+            train_loader=train_loader,
             val_loader=val_loader_expert,
             optimizer=optimizer,
-            n_epochs=n_epochs_expert[i],
+            n_epochs=n_epochs,
             create_video=create_video,
             max_batch_per_epoch=max_batch_per_epoch,
             max_batch_per_val=max_batch_per_val,
@@ -371,12 +255,14 @@ def main_train_expert():
         trainer_expert.train_model()
         if i < len(models)-1:
             #do the upkernel trick on the best model
-            model.load_state_dict(torch.load(trainer_expert.best_model_path, map_location=DEVICE))
+            model.load_state_dict(torch.load(trainer_expert.best_model_path_mixed, map_location=DEVICE))
             upkern_load_weights(models[i+1], model)
         else:
-            main_predict(trainer_expert.best_model_path, expected_iou=0.5, probability_threshold=0.5, path_notes=f"full cycle prediction")
+            main_predict(trainer_expert.best_model_path_mixed, expected_iou=0.5, probability_threshold=0.5, path_notes=f"full cycle prediction")
+            best_model_path_finetune = main_train_finetune_no_val(trainer_expert.best_model_path_mixed)
+            main_predict(best_model_path_finetune, expected_iou=0.5, probability_threshold=0.5, path_notes=f"full cycle prediction with finetune")
 
-def main_train_finetune_no_val():
+def main_train_finetune_no_val(model_path: Path):
         # Setup machine configuration (called here to avoid multiprocessing print issues)
     DEVICE, batch_size, sequence_length, TARGET_SHAPE, NUM_WORKERS = setup_machine_config(workspace="home_station")
     
@@ -391,10 +277,10 @@ def main_train_finetune_no_val():
     ######HYPERPARAMETERS######################################################
     HYPERPARAMETERS = {
         "upkernel_lr": 5e-5,
-        "n_epochs_expert": 100,
+        "n_epochs_expert": 20,
         "model_id": 'S',
         "random_label_position": True,
-        "rotation_chance": 0.8,
+        "rotation_chance": 0.0,
         "upkernel_size": 7,
         "deep_supervision": True,
     }
@@ -409,6 +295,7 @@ def main_train_finetune_no_val():
     #get the pretrained model from the amateur training
 
     model = SegmentationNet(model_id=model_id, kernel_size=upkernel_size, deep_supervision=deep_supervision).to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
 
     optimizer = optim.Adam(model.parameters(), lr=upkernel_lr)
     # Load data
@@ -430,9 +317,6 @@ def main_train_finetune_no_val():
     persistent_workers=True,
     )
 
-    model_path = Path(r"D:\ETH\Master\AML\AML2\training\20251218_183701_dim160x224\models\ep025_iouiou05275.pt")
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-
     # Use the new SegmentationTrainer expert class
     trainer_expert = SegmentationTrainer(
         model=model,
@@ -451,6 +335,7 @@ def main_train_finetune_no_val():
         description=("EXPERT TRAINING Full Data Finetune\n" + write_configuration_string(HYPERPARAMETERS))
     )
     trainer_expert.train_model()
+    return trainer_expert.best_model_path_train
 
 def main_predict(model_path: Path, expected_iou: float = 0.5, probability_threshold: float = 0.5, path_notes: str = ""):
     """
@@ -527,11 +412,45 @@ def main_predict(model_path: Path, expected_iou: float = 0.5, probability_thresh
     print(f"Videos saved to {output_dir / 'videos'}")
     return predictions, output_file
 
+
+def release_to_kaggle(csv_file: Path, message: str = ""):
+    import sys
+    from pathlib import Path
+    from kaggle.api.kaggle_api_extended import KaggleApi
+    if not csv_file.exists():
+        print(f"Error: File not found: {csv_file}")
+        return
+    
+    api = KaggleApi()
+    api.print_config_values()
+    api.set_config_value('username', 'cedricgrieder')
+    api.set_config_value('key', 'KGAT_aeac930ab61b3d68d83c8c57b24dbb17')
+    os.environ['KAGGLE_USERNAME'] = 'cedricgrieder'   # Replace with your actual username
+    os.environ['KAGGLE_KEY'] = 'KGAT_aeac930ab61b3d68d83c8c57b24dbb17'
+    try:
+        api.authenticate()  # Will raise if credentials are missing/invalid
+    except Exception as e:
+        print("Authentication failed:")
+        print(e)
+        return
+    
+    try:
+        result = api.competition_submit_cli(
+            file_name=str(csv_file),
+            message=message or "Submitted via Python API",
+            competition="eth-aml-2025-project-task-2",
+            quiet=False  # Set to True for less output
+        )
+        print("Submission successful!")
+        print(result)  # Prints submission details
+    except Exception as e:
+        print("Submission failed:")
+        print(e)
+
+
 if __name__ == '__main__':
     mode = "train_expert"
-    if mode == "train":
-        main_train()
-    elif mode == "train_expert":
+    if mode == "train_expert":
         main_train_expert()
     elif mode == "train_finetune_no_val":
         main_train_finetune_no_val()
@@ -545,4 +464,5 @@ if __name__ == '__main__':
                 probability_threshold=threshold,
                 path_notes=f"threshold_045"
             )
-
+    elif mode == "release_to_kaggle":
+        release_to_kaggle(csv_file=Path(r'D:\ETH\Master\AML\AML2\results\20251218_05430\submission.csv'), message="automatic release test")
